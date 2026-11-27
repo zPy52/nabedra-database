@@ -80,7 +80,9 @@ impl SplitSearch {
             .is_some_and(|source| source.statement.read_ts == read_ts)
     }
     pub(super) fn heap_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + columns_bytes(&self.schema.columns)
+        std::mem::size_of::<Self>()
+            + columns_bytes(&self.schema.columns)
+            + extra_bytes(&self.schema.serving, &self.schema.text)
     }
 }
 
@@ -97,15 +99,50 @@ pub struct SearchFence {
     /// As for `DirectSchemaChange::Fence`.
     pub lifecycle: Option<Uuid>,
     pub columns: Vec<SearchColumn>,
-    /// As `SearchSchema::serving`. J fills and checks it; until then `fence`
-    /// stores none.
+    /// As `SearchSchema::serving`: ascending, a subset of `columns`.
     pub serving: Vec<ColumnId>,
-    /// As `SearchSchema::text`.
+    /// As `SearchSchema::text`: ascending ids, none shared with `columns`.
     pub text: Vec<TextColumn>,
 }
 impl SearchFence {
     pub(super) fn heap_bytes(&self) -> usize {
-        columns_bytes(&self.columns)
+        columns_bytes(&self.columns) + extra_bytes(&self.serving, &self.text)
+    }
+    /// The shape rules a fence must meet before apply compares it with the
+    /// group's schema: ascending unique ids, a published subset, at most
+    /// `MAX_SEARCH_COLUMNS` columns of both kinds, known analyzers.
+    pub(crate) fn well_formed(&self) -> bool {
+        let languages = crate::protocol::FULL_TEXT_LANGUAGES;
+        self.epoch != 0
+            && self.columns.len().saturating_add(self.text.len()) <= MAX_SEARCH_COLUMNS
+            && self.columns.iter().all(SearchColumn::valid)
+            && self.columns.is_sorted_by(|a, b| a.id < b.id)
+            && self.serving.is_sorted_by(|a, b| a < b)
+            && self
+                .serving
+                .iter()
+                .all(|id| self.columns.iter().any(|column| column.id == *id))
+            && self.text.is_sorted_by(|a, b| a.id < b.id)
+            && self.text.iter().all(|text| {
+                text.id != 0
+                    && !text.column.as_str().is_empty()
+                    && languages.contains(&text.language.as_str())
+                    && self.columns.iter().all(|column| column.id != text.id)
+            })
+            && self.columns.iter().all(|column| column.id != 0)
+    }
+    /// Epoch 0 with nothing else: read the group's schema through the log.
+    pub(crate) fn is_probe(&self) -> bool {
+        self.epoch == 0
+            && self.columns.is_empty()
+            && self.serving.is_empty()
+            && self.text.is_empty()
+            && self.lifecycle.is_none()
+    }
+    /// The highest id this fence names.
+    fn last(&self) -> ColumnId {
+        let vector = self.columns.last().map_or(0, |column| column.id);
+        vector.max(self.text.last().map_or(0, |text| text.id))
     }
 }
 fn columns_bytes(columns: &Vec<SearchColumn>) -> usize {
@@ -114,6 +151,14 @@ fn columns_bytes(columns: &Vec<SearchColumn>) -> usize {
             .iter()
             .filter_map(|column| column.source.as_ref())
             .map(|source| source.capacity_bytes())
+            .sum::<usize>()
+}
+fn extra_bytes(serving: &Vec<ColumnId>, text: &Vec<TextColumn>) -> usize {
+    serving.capacity() * std::mem::size_of::<ColumnId>()
+        + text.capacity() * std::mem::size_of::<TextColumn>()
+        + text
+            .iter()
+            .map(|text| text.column.capacity_bytes() + text.language.capacity_bytes())
             .sum::<usize>()
 }
 /// Closes `ts`: no later commit at or below it applies in this range. The leader
@@ -134,6 +179,9 @@ pub enum SearchReply {
         epoch: u64,
         direct: Option<direct::DirectSchema>,
     },
+    /// The answer to a probe (`SearchFence::is_probe`): the group's schema,
+    /// `None` before its first fence.
+    Schema(Option<Box<SearchSchema>>),
     Closed {
         floor: CommitTs,
     },
@@ -167,6 +215,7 @@ pub(super) fn reply(
     let wrote = !matches!(
         reply,
         SearchReply::Rejected(_)
+            | SearchReply::Schema(_)
             | SearchReply::AlreadySet
             | SearchReply::Obsolete
             | SearchReply::Unmatched
@@ -230,15 +279,19 @@ pub(super) fn fence(
         return rejected(tx, Fault::NotInitialized);
     };
     if !matches!(&group.kind, GroupKind::Data { table_id, .. } if *table_id == command.table_id)
-        || command.epoch == 0
-        || command.columns.len() > MAX_SEARCH_COLUMNS
-        || !command.columns.iter().all(SearchColumn::valid)
-        || !command.columns.is_sorted_by(|a, b| a.id < b.id)
+        || !(command.well_formed() || command.is_probe())
     {
         return rejected(tx, Fault::InvalidBinding);
     }
     if config.authority != command.authority {
         return rejected(tx, Fault::StaleAuthority);
+    }
+    // A probe reads the schema in log order and writes nothing: the DDL
+    // coordinator picks an epoch above every group's and checks what a
+    // fence installed (`planner::search_ddl`).
+    if command.is_probe() {
+        let schema = config.search.map(Box::new);
+        return reply(tx, SearchReply::Schema(schema));
     }
     if frozen(&config) {
         return rejected(tx, Fault::SplitInProgress);
@@ -259,11 +312,18 @@ pub(super) fn fence(
     {
         return rejected(tx, Fault::InvalidBinding);
     }
-    // An id names one incarnation: it keeps its definition and never returns.
+    // An id names one incarnation of either kind: it keeps its definition and
+    // never returns once dropped. `serving` may grow or shrink freely.
+    let current = ready(&config);
     let reused = command.columns.iter().any(|column| {
-        match ready(&config).and_then(|schema| schema.column(column.id)) {
+        match current.and_then(|schema| schema.column(column.id)) {
             Some(existing) => existing != column,
             None => epoch != 0 && column.id <= high,
+        }
+    }) || command.text.iter().any(|text| {
+        match current.and_then(|schema| schema.text.iter().find(|old| old.id == text.id)) {
+            Some(old) => old.column != text.column || old.language != text.language,
+            None => epoch != 0 && text.id <= high,
         }
     });
     if reused {
@@ -273,15 +333,12 @@ pub(super) fn fence(
         return rejected(tx, Fault::ResourceLimit);
     };
     let first = config.search.is_none();
-    let last = command.columns.last().map_or(0, |column| column.id);
-    // TODO(J): validate and store `command.serving` and `command.text`
-    // (contract-w2 2.7, DB-9); S stores both empty.
     config.search = Some(SearchSchema {
         epoch: command.epoch,
         columns: command.columns.clone(),
-        high: last.max(high),
-        serving: Vec::new(),
-        text: Vec::new(),
+        high: command.last().max(high),
+        serving: command.serving.clone(),
+        text: command.text.clone(),
     });
     config.direct_schema = Some(direct);
     if encoded_length(&config, METADATA_BYTES).is_err() {

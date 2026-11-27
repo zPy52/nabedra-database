@@ -4,7 +4,7 @@ use super::{
     CanonicalJson, Change, MvccKey, PreparedWrite,
     catalog::{
         CatalogHandle, CatalogRead, IntentRef, NameRecord, OwnedRecord, PinnedCatalog, PointCatalog, RouteRead,
-        RoutingPage, RoutingRoot, ShardRoute, TableRecord, decode_record,
+        RoutingPage, RoutingRoot, ShardRoute, StoredRow, TableRecord, decode_record,
     },
     store::{
         ParticipantHandle,
@@ -905,7 +905,7 @@ impl NativePlanner {
     ) -> Result<
         (
             Option<nabedra_oltp_types::types::CommitTs>,
-            Option<OwnedRecord<Row>>,
+            Option<OwnedRecord<StoredRow>>,
         ),
         PlanError,
     > {
@@ -1041,7 +1041,7 @@ impl NativePlanner {
         participant: Arc<ParticipantHandle>,
         candidate: &CandidateRow,
         expected: Option<nabedra_oltp_types::types::CommitTs>,
-        old: Option<OwnedRecord<Row>>,
+        old: Option<OwnedRecord<StoredRow>>,
         grouped: &mut MutationGroups,
         owner: &mut Arc<crate::oltp::pool::ScratchLease>,
         used: &mut usize,

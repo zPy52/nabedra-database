@@ -210,10 +210,8 @@ async fn vs16_a_search_table_survives_a_native_backup_and_restore_with_its_colum
     let none = fence(&target, &group, table, 2, Vec::new()).await;
     assert!(!fenced(&none), "{none:?}");
     assert!(fenced(&fence(&target, &group, table, 2, vec![dense(2)]).await));
-    // The rows: a fence raises the range's direct epoch and the Catalog
-    // publishes after it (task J), so the table's queued reads wait for that
-    // publication, which this test does not model. A backup of the restored
-    // range shows them instead, with the columns the restore installed.
+    // The rows, with the columns the restore installed, as a backup of the
+    // restored range shows them.
     let again = path.join("again");
     target.backup_native(&again, owner(), None).await.unwrap();
     let restored = archived(&target, &again, table);
@@ -255,5 +253,24 @@ async fn vs15_a_queued_row_write_of_a_fenced_search_range_is_applied() {
         };
         assert_eq!(receipt.state, RequestState::Succeeded, "{operation}: {:?}", receipt.error);
     }
+    source.drain().await.unwrap();
+}
+
+/// int0 duty (task J). A queued read of a vector table: its stored rows hold
+/// vectors and nulls, which the strict scalar grammar of `Row` refused, so a
+/// queued `get` failed with "invalid pinned catalog or routing lineage",
+/// before the range's fence as after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vs15_a_queued_get_of_a_vector_table_is_served_before_and_after_its_fence() {
+    let path = std::env::temp_dir().join(format!("nabedra-search-get-{}", nabedra_rt::ids::uuid_v4()));
+    std::fs::create_dir(&path).unwrap();
+    let _cleanup = Cleanup(path.clone());
+    let (source, table, group) = search_table(&path).await;
+    let get = |key: &str| request("table.get", json!({"table_id":table,"key":key}));
+    let row = json!({"id":"a","v":{"f32":"AACAPwAAAEA="}});
+    assert_eq!(run(&source, get("a")).await.1.result, Some(row.clone()));
+    assert_eq!(run(&source, get("b")).await.1.result, Some(json!({"id":"b","v":null})));
+    assert!(fenced(&fence(&source, &group, table, 1, vec![dense(2)]).await));
+    assert_eq!(run(&source, get("a")).await.1.result, Some(row));
     source.drain().await.unwrap();
 }

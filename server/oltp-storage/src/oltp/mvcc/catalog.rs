@@ -607,6 +607,31 @@ pub async fn decode_canonical<T: DeserializeOwned + Send + Sync + 'static>(
         .await
 }
 
+/// A stored row in any column types. `Row`'s own `Deserialize` takes the four
+/// scalars only (the request grammar), so a row of a table with vector, list
+/// or nullable columns decodes through `protocol::decode_row` instead.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredRow(pub crate::protocol::Row);
+impl<'de> Deserialize<'de> for StoredRow {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let raw = Box::<RawValue>::deserialize(d)?;
+        crate::protocol::decode_row(raw.get())
+            .map(Self)
+            .map_err(|_| serde::de::Error::custom("malformed stored row"))
+    }
+}
+impl Serialize for StoredRow {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(s)
+    }
+}
+impl std::ops::Deref for StoredRow {
+    type Target = crate::protocol::Row;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 pub(super) fn contains(span: &KeySpan, key: &Key) -> bool {
     span.start
         .as_ref()

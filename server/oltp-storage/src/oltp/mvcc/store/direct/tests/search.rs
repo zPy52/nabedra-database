@@ -20,6 +20,7 @@ mod copies;
 mod crash;
 mod embed;
 mod feed;
+mod fence;
 
 /// A dense vector, an embedded dense vector, a sparse and a multi-vector column.
 const PLAIN: ColumnId = 1;
