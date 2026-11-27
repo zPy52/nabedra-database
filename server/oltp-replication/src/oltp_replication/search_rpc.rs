@@ -891,7 +891,7 @@ pub enum SearchCommand {
         name: Text<128>,
     },
 }
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum SearchControlReply {
     Done { epoch: u64 },

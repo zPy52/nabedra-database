@@ -223,6 +223,10 @@ impl NativePlanner {
                 )
                 .await;
             }
+            // A search table fences with a SearchFence of the same columns.
+            let (fence, record) = self
+                .prepare_lifecycle_fence(pin, &table, txn.request_id)
+                .await?;
             let plan = self.catalog_index_plan(
                 vec![
                     PreparedWrite {
@@ -230,7 +234,7 @@ impl NativePlanner {
                             table_id: maintenance.table_id,
                         },
                         expected_version: table_version,
-                        change: self.index_put(&table.with_lifecycle(txn.request_id))?,
+                        change: self.index_put(&record)?,
                     },
                     PreparedWrite {
                         key,
@@ -254,7 +258,7 @@ impl NativePlanner {
             .await?;
             // Fence before publishing the new lifecycle. A rejected
             // validation must leave Data on the current Catalog lifecycle.
-            self.fence_direct_writers(pin, maintenance.table_id, Some(txn.request_id))
+            self.run_lifecycle_fence(pin, maintenance.table_id, fence)
                 .await?;
             Ok(plan)
         }
@@ -440,10 +444,17 @@ impl NativePlanner {
         let result = async {
             // Plan section 7: a live table's lifecycle changes with the
             // retirement; a dropped table was fenced by its drop.
-            if table.is_some() {
-                self.fence_direct_writers(pin, maintenance.table_id, Some(txn.request_id))
-                    .await?;
-            }
+            let table_record = match table.as_ref() {
+                Some(table) => {
+                    let (fence, record) = self
+                        .prepare_lifecycle_fence(pin, table, txn.request_id)
+                        .await?;
+                    self.run_lifecycle_fence(pin, maintenance.table_id, fence)
+                        .await?;
+                    Some(record)
+                }
+                None => None,
+            };
             let closed_key = MvccKey::CatalogIndexClosed {
                 table_id: maintenance.table_id,
                 closure_id: closure_id(&maintenance)?,
@@ -474,8 +485,8 @@ impl NativePlanner {
                         table_id: maintenance.table_id,
                     },
                     expected_version: table_version,
-                    change: match table {
-                        Some(table) => self.index_put(&table.with_lifecycle(txn.request_id))?,
+                    change: match table_record {
+                        Some(record) => self.index_put(&record)?,
                         None => Change::Keep,
                     },
                 },

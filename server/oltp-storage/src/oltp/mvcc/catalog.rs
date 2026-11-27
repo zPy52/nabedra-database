@@ -465,6 +465,7 @@ impl CatalogHandle {
         route: ShardRoute,
         page_id: Uuid,
         guard: &VerifiedLifecycleGuard,
+        search: Option<CatalogSearch>,
     ) -> Result<Vec<PreparedWrite>, ProtocolError> {
         descriptor.validate()?;
         let binding = guard.binding();
@@ -495,8 +496,8 @@ impl CatalogHandle {
             schema_epoch: route.schema_epoch,
             routing_epoch: route.routing_epoch,
             lifecycle_id: table_id,
-            // TODO(J): a table created with search columns records them here.
-            search: None,
+            // A table created with search columns: its group was fenced first.
+            search,
         };
         let entries = [
             (

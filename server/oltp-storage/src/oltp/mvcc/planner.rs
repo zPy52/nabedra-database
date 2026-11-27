@@ -38,6 +38,7 @@ pub use point_route::PointRoute;
 mod query;
 use query::schedule::QueryScheduler;
 mod query_metrics;
+pub mod search_ddl;
 #[doc(hidden)]
 pub mod split;
 pub type ResolveFuture<'a, T> =
@@ -134,6 +135,7 @@ pub struct NativePlanner {
     query_metrics: Arc<query_metrics::QueryMetrics>,
     query_scheduler: QueryScheduler,
     direct: direct_fence::DirectProbeSlot,
+    search: search_ddl::SearchSlot,
 }
 /// Retain only one charged route page and its selected participant during a
 /// mutation plan. The cache cannot outlive or be reused with another pin.
@@ -162,6 +164,7 @@ impl NativePlanner {
             query_metrics,
             query_scheduler,
             direct: Default::default(),
+            search: Default::default(),
         })
     }
     pub(crate) fn with_scoped_execution(
@@ -179,6 +182,7 @@ impl NativePlanner {
             query_metrics: self.query_metrics.clone(),
             query_scheduler: self.query_scheduler.clone(),
             direct: self.direct.clone(),
+            search: self.search.clone(),
         })
     }
 
@@ -280,6 +284,27 @@ impl NativePlanner {
                 Ok(operation)
             })
             .await?;
+        // Search DDL and status (contract-w2 2.6): Catalog steps fenced first.
+        match &operation {
+            Operation::AddColumn(_)
+            | Operation::DropColumn(_)
+            | Operation::AddFullText(_)
+            | Operation::DropFullText(_) => {
+                return self
+                    .plan_search_ddl(&operation, pin, txn, request, table, version, owner.clone())
+                    .await
+                    .map(PlannedOperation::Mutation);
+            }
+            Operation::SearchStatus(_) => {
+                let status = self.search_status(pin, &table).await?;
+                return Ok(PlannedOperation::Read(
+                    self.catalog
+                        .resources()
+                        .encode(&status, protocol::MAX_BODY_BYTES - 128)?,
+                ));
+            }
+            _ => {}
+        }
         if let Operation::Drop(_) = operation {
             return self
                 .drop_table(pin, txn, request, table, version, owner.clone())
@@ -643,10 +668,24 @@ impl NativePlanner {
         let planned = async {
             let epochs = self.catalog.participant().epochs().await?;
             let route = self.resolver.create_data(&descriptor, pin).await?;
+            // A table created with search columns: its group takes them, all
+            // published, at epoch 1 before the Catalog names the table.
+            let search = match super::catalog::CatalogSearch::of_descriptor(&descriptor)? {
+                Some(mut search) => {
+                    let participant = self.resolver.participant(&route.group).await?;
+                    let groups = self.probe_groups(vec![participant]).await?;
+                    let epoch = groups.next_epoch(0)?;
+                    let template = groups.raise_high(search.clone()).template(Some(id));
+                    self.fence_search(&groups, id, epoch, &template).await?;
+                    search.epoch = epoch;
+                    Some(search)
+                }
+                None => None,
+            };
             let page = derived_uuid(b"nabedra/route-page/v1", id, txn.request_id);
             let mut writes = self
                 .catalog
-                .create_writes(descriptor.clone(), route, page, &guard)?;
+                .create_writes(descriptor.clone(), route, page, &guard, search)?;
             writes[0].expected_version = name_version;
             Ok(MutationPlan {
                 participants: vec![ParticipantWrites {
@@ -708,8 +747,19 @@ impl NativePlanner {
                     .await?,
             )?;
             // Plan section 7: stop direct writers in the Data log before the
-            // Catalog publishes the drop. The exclusive guard is held.
-            self.fence_direct_writers(pin, id, None).await?;
+            // Catalog publishes the drop. The exclusive guard is held. A
+            // search table's groups give up their columns (`StartDrop`).
+            match table.search.as_ref() {
+                Some(search) => {
+                    let groups = self.search_groups(pin, id).await?;
+                    let epoch = groups.next_epoch(search.epoch)?;
+                    let template = super::catalog::CatalogSearch::empty().template(None);
+                    self.fence_search(&groups, id, epoch, &template).await?;
+                }
+                None => {
+                    self.fence_direct_writers(pin, id, None).await?;
+                }
+            }
             let writes = vec![
                 PreparedWrite {
                     key: MvccKey::CatalogName { name },
