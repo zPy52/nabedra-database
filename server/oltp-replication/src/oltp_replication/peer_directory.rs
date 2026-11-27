@@ -24,6 +24,8 @@ use std::{
 use uuid::Uuid;
 
 // Keep the existing RPC trace filter and test subscribers working after the move.
+mod search;
+
 const TRACE_TARGET: &str = "nabedra_database_server::oltp_replication::multiplex::directory";
 
 /// REP6: a Data-only worker refreshes its revocation view this often.
@@ -60,6 +62,8 @@ struct RemoteRevocations {
 enum Role {
     Worker,
     Api(Text<128>),
+    Search(Text<128>),
+    Embed(Text<128>),
     BootstrapControl(GroupIdentity),
     PreparedControl,
 }
@@ -512,19 +516,10 @@ impl AppliedPeerDirectory {
             + 256
             + enrollment.endpoint.capacity_bytes()
             + enrollment.server_name.capacity_bytes()
-            + match &role {
-                Role::Worker | Role::PreparedControl => 0,
-                Role::Api(database) => database.capacity_bytes(),
-                Role::BootstrapControl(group) => group.database.capacity_bytes(),
-            };
+            + search::role_bytes(&role);
         let mut entries = self.entries.write().map_err(|_| unavailable())?;
         if let Some(old) = entries.get_mut(&enrollment.worker_id) {
-            if matches!(
-                (&old.role, &role),
-                (Role::Worker, Role::Api(_))
-                    | (Role::Api(_), Role::Worker)
-                    | (Role::BootstrapControl(_), Role::Api(_))
-            ) {
+            if search::relabels(&old.role, &role) {
                 return Err(invalid());
             }
             if old.enrollment.enrollment_revision > enrollment.enrollment_revision {
@@ -623,6 +618,7 @@ impl AppliedPeerDirectory {
                 break;
             }
         }
+        self.refresh_members(control, epoch).await?;
         let prepared = control.restart_preparation(revision).await?;
         let restart = prepared
             .filter(|prepared| !prepared.enrolled)
@@ -873,6 +869,9 @@ impl PeerDirectory for AppliedPeerDirectory {
         let entry = entries.get(&peer.worker_id).ok_or_else(unavailable)?;
         if WorkerIdentity::from(&entry.enrollment) != peer {
             return Err(invalid());
+        }
+        if let Some(admitted) = search::verify(&entry.role, group, purpose) {
+            return admitted.then_some(TransportTrust::AppliedEnrollment).ok_or_else(invalid);
         }
         match &entry.role {
             Role::Worker => Ok(TransportTrust::AppliedEnrollment),

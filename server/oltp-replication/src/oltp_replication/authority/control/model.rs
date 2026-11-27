@@ -445,6 +445,13 @@ pub enum ControlCommand {
         authorization: AuthorizationStamp,
         proof: Box<super::GroupDamageReplacement>,
     },
+    /// Search members, assignments and models (contract-w2 2.6). `unix_ms`
+    /// is the accepting leader's clock, so apply stays deterministic.
+    Search {
+        operation_id: Uuid,
+        unix_ms: u64,
+        command: Box<crate::oltp_replication::search_rpc::SearchCommand>,
+    },
 }
 impl ControlCommand {
     pub fn operation_id(&self) -> Uuid {
@@ -493,7 +500,8 @@ impl ControlCommand {
             | Self::PublishFence { operation_id, .. }
             | Self::GroupDamaged { operation_id, .. }
             | Self::GroupDamageReplacementBegin { operation_id, .. }
-            | Self::GroupDamageReplaced { operation_id, .. } => *operation_id,
+            | Self::GroupDamageReplaced { operation_id, .. }
+            | Self::Search { operation_id, .. } => *operation_id,
         }
     }
 }
@@ -573,6 +581,7 @@ impl OwnedPayload for ControlCommand {
                     + 2 * plan.group.database.capacity_bytes()
                     + plan.members.capacity() * size_of::<ReplicaMember>()
             }
+            Self::Search { command, .. } => super::search::command_bytes(command),
             _ => 0,
         })
     }
@@ -673,6 +682,7 @@ pub enum ControlReply {
         fenced_groups: u64,
         excluded_workers: u64,
     },
+    Search(crate::oltp_replication::search_rpc::SearchControlReply),
     Rejected(Fault),
 }
 

@@ -44,6 +44,8 @@ mod pool_drain;
 #[cfg(test)]
 mod restart;
 #[cfg(test)]
+mod search;
+#[cfg(test)]
 mod system_recovery;
 
 async fn apply_to(
