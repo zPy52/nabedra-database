@@ -192,6 +192,9 @@ fn vs14_reports_are_leader_memory_and_a_failover_loses_them() {
     assert!(reports(control, 2, table).unwrap().is_empty(), "a new leader term holds nothing");
     record_report(control, 2, first.clone()).unwrap();
     assert_eq!(reports(control, 2, table).unwrap().len(), 1, "the repeated report counts");
+    assert_eq!(reports(control, 1, table).unwrap_err().code, ErrorCode::Conflict);
+    assert_eq!(record_report(control, 1, first.clone()).unwrap_err().code, ErrorCode::Conflict);
+    assert_eq!(reports(control, 2, table).unwrap(), [first.clone()], "an older term cannot clear seen");
     // A new process of the worker replaces its report.
     let mut restarted = first.clone();
     restarted.process = id(9);
