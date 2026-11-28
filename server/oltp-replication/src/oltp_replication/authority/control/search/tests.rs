@@ -6,6 +6,22 @@ use crate::oltp_replication::search_rpc::RangeReport;
 fn id(n: u128) -> Uuid {
     Uuid::from_u128(n)
 }
+/// Records a page of a worker that holds every shard, so membership retires
+/// none of its other snapshots.
+fn record_report(control: Uuid, term: u64, report: SearchReport) -> Result<(), ProtocolError> {
+    super::record_report(control, term, report, |_| true)
+}
+/// An assignment at `epoch` whose shard `i` has the workers `shards[i]`.
+fn assignment(table: Uuid, epoch: u64, shards: &[&[u128]], next: Option<SearchMove>) -> SearchAssignment {
+    let shard = |workers: &&[u128]| SearchShard {
+        spans: vec![crate::oltp::mvcc::store::KeySpan { start: None, end: None }],
+        replicas: workers
+            .iter()
+            .map(|worker| SearchReplica { worker_id: id(*worker), since_epoch: 1, draining: None })
+            .collect(),
+    };
+    SearchAssignment { table_id: table, epoch, shards: shards.iter().map(shard).collect(), next }
+}
 fn member(n: u128, zone: &str, role: SearchRole) -> SearchMember {
     SearchMember {
         database: Text::try_from("default").unwrap(),
@@ -231,9 +247,9 @@ fn vs14_range_status_counts_a_report_only_for_the_columns_it_names() {
     assert_eq!(status[0].lag_ms, Some(5), "the syncing replica's lag does not count");
 }
 
-/// Reports are kept per shard, so a worker that moved to another shard at a
-/// newer assignment epoch must not leave its older snapshot counting as
-/// ready in `range_status`. Another worker's snapshot stays.
+/// Reports are kept per shard, so a worker that moved to another shard must
+/// not leave its snapshot of the shard it left counting as ready in
+/// `range_status`. Another worker's snapshot stays.
 #[test]
 fn vs14_a_newer_epoch_retires_the_workers_older_shard_snapshots() {
     let control = nabedra_rt::ids::uuid_v4();
@@ -244,12 +260,41 @@ fn vs14_a_newer_epoch_retires_the_workers_older_shard_snapshots() {
     record_report(control, 1, kept.clone()).unwrap();
     let mut next = report(10, table, 2, vec![(1, ColumnState::Syncing)]);
     next.ranges[0].group_id = id(78);
-    record_report(control, 1, next.clone()).unwrap();
+    // Worker 10 now holds shard 0 only.
+    let moved = assignment(table, 2, &[&[10], &[11]], None);
+    super::record_report(control, 1, next.clone(), |shard| holds_shard(&moved, id(10), shard)).unwrap();
     let held = reports(control, 1, table).unwrap();
     assert_eq!(held, [next, kept]);
     assert!(range_status(&held).iter().all(|status| status.ready.is_empty()));
     let counts = memory(control, 1, |memory| (memory.ranges, memory.worker_ranges.get(&id(10)).copied())).unwrap();
     assert_eq!(counts, (2, Some(1)), "the retired snapshot's ranges are released");
+}
+
+/// rv-j3 N4: during a move, the new replica's first report at the move's
+/// epoch keeps its snapshots of the other shards it still holds, reported at
+/// the published epoch; only a shard it no longer holds is retired. Before,
+/// every older-epoch snapshot was retired and readiness flapped low.
+#[test]
+fn rvj3_a_joining_worker_keeps_its_reports_of_the_shards_it_still_holds() {
+    let control = nabedra_rt::ids::uuid_v4();
+    let table = id(1);
+    // Worker 10 serves shard 1 and joins shard 0 at epoch 2; it left shard 2.
+    let moving = assignment(table, 1, &[&[11], &[10], &[11]], Some(SearchMove { shard: 0, ..mv(10, None, 2) }));
+    let holds = |shard| holds_shard(&moving, id(10), shard);
+    let mut served = SearchReport { shard: 1, ..report(10, table, 1, vec![(1, ColumnState::Ready)]) };
+    served.ranges[0].group_id = id(78);
+    let mut left = SearchReport { shard: 2, ..report(10, table, 1, vec![(1, ColumnState::Ready)]) };
+    left.ranges[0].group_id = id(79);
+    record_report(control, 1, served.clone()).unwrap();
+    record_report(control, 1, left).unwrap();
+    let joining = report(10, table, 2, vec![(1, ColumnState::Syncing)]);
+    super::record_report(control, 1, joining.clone(), holds).unwrap();
+    let held = reports(control, 1, table).unwrap();
+    assert_eq!(held, [joining, served]);
+    let ready: Vec<_> = range_status(&held).into_iter().map(|range| (range.group_id, range.ready)).collect();
+    assert_eq!(ready, [(id(77), vec![]), (id(78), vec![1])]);
+    let counts = memory(control, 1, |memory| (memory.ranges, memory.worker_ranges.get(&id(10)).copied())).unwrap();
+    assert_eq!(counts, (2, Some(2)));
 }
 
 /// rv-j F4: a move publishes only when every page of one snapshot of the

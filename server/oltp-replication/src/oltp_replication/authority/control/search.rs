@@ -435,9 +435,24 @@ fn memory<T>(control: Uuid, term: u64, f: impl FnOnce(&mut Memory) -> T) -> Resu
     }
     Ok(f(memory))
 }
+/// Whether `worker` serves or drains `shard` of `assignment`, or is the
+/// pending move's new replica of it.
+pub(crate) fn holds_shard(assignment: &SearchAssignment, worker: Uuid, shard: u32) -> bool {
+    assignment.next.is_some_and(|mv| mv.add == worker && mv.shard == shard)
+        || usize::try_from(shard)
+            .ok()
+            .and_then(|shard| assignment.shards.get(shard))
+            .is_some_and(|shard| shard.replicas.iter().any(|replica| replica.worker_id == worker))
+}
 /// Records a page in the leader's current term. A newer assignment,
 /// restarted worker, or newer report supersedes the last snapshot.
-pub(crate) fn record_report(control: Uuid, term: u64, report: SearchReport) -> Result<(), ProtocolError> {
+/// `holds(shard)` says whether the reporting worker still holds a shard.
+pub(crate) fn record_report(
+    control: Uuid,
+    term: u64,
+    report: SearchReport,
+    holds: impl Fn(u32) -> bool,
+) -> Result<(), ProtocolError> {
     if !valid_report(&report) {
         return Err(invalid("invalid search report"));
     }
@@ -458,21 +473,15 @@ pub(crate) fn record_report(control: Uuid, term: u64, report: SearchReport) -> R
                 return Err(invalid("search report pages disagree on page count"));
             }
         }
-        // A newer assignment epoch also retires the worker's snapshots of the
-        // table's other shards at older epochs (it no longer holds them as
-        // reported), so `range_status` never counts a stale snapshot.
+        // A report also retires the worker's snapshots of the table's shards
+        // it no longer holds, so `range_status` never counts a stale one. Its
+        // other shards keep theirs, whatever epoch they were reported at: a
+        // move's new replica reports at the move's epoch (rv-j3 N4).
         let worker = report.worker_id;
         let stale: Vec<((Uuid, Uuid, u32), usize)> = memory
             .reports
             .range((report.table_id, worker, 0)..=(report.table_id, worker, u32::MAX))
-            .filter(|(other, held)| {
-                **other != key
-                    && held
-                        .pages
-                        .values()
-                        .next()
-                        .is_some_and(|page| page.assignment_epoch < report.assignment_epoch)
-            })
+            .filter(|(other, _)| **other != key && !holds(other.2))
             .map(|(other, held)| (*other, held.ranges))
             .collect();
         let accounting = || invalid("search report accounting is inconsistent");

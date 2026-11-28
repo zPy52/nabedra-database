@@ -4,8 +4,8 @@
 use super::*;
 use crate::oltp_replication::{
     authority::control::search::{
-        MAX_MEMBERS_PAGE, SearchMembership, SearchRequest, SearchStatus, assignment_key, member_key,
-        range_status, reconcile_with, record_report, reports,
+        MAX_MEMBERS_PAGE, SearchMembership, SearchRequest, SearchStatus, assignment_key, holds_shard,
+        initial_assignment, member_key, range_status, reconcile_with, record_report, reports,
     },
     search_rpc::{
         CallerRole, EmbedModel, RoleCheck, SEARCH_ASSIGNMENT_PREFIX, SEARCH_MEMBER_PREFIX,
@@ -147,7 +147,19 @@ impl ControlHandle {
     /// IndexLifecycle `FinishSync`/`ReportAgain`, SearchAssign `Report`.
     pub(crate) async fn search_report(&self, report: SearchReport) -> Result<(), ProtocolError> {
         let term = self.leader_term().await?;
-        record_report(self.identity().group_id, term, report)
+        let table_id = report.table_id;
+        let raw = self
+            .read(move |view| {
+                let assignment: Option<SearchAssignment> = load(view, &assignment_key(table_id))?;
+                view.encode(&assignment)
+            })
+            .await?;
+        let assignment: Option<SearchAssignment> = machine::decode(raw.as_ref())?;
+        let assignment = assignment.unwrap_or_else(|| initial_assignment(table_id));
+        let worker = report.worker_id;
+        record_report(self.identity().group_id, term, report, |shard| {
+            holds_shard(&assignment, worker, shard)
+        })
     }
     /// The reports of `table` this leader holds; none on a follower.
     pub(crate) async fn search_reports(&self, table: Uuid) -> Result<Vec<SearchReport>, ProtocolError> {
