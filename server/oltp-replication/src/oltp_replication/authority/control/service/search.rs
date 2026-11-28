@@ -267,3 +267,6 @@ fn reconcile_operation(
     ))?;
     Uuid::from_slice(&digest.as_bytes()[..16]).map_err(|_| stale())
 }
+
+#[cfg(test)]
+mod tests;
