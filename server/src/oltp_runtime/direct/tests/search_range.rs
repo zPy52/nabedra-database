@@ -57,6 +57,7 @@ async fn vs15_every_direct_row_write_of_a_fenced_search_range_is_applied() {
             }],
             serving: Vec::new(),
             text: Vec::new(),
+            names: Vec::new(),
         }),
         voter.handle.resources(),
         ByteClass::Progress,
