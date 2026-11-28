@@ -12,10 +12,12 @@
 use crate::oltp_replication::{
     search_rpc::{
         ColumnState, Draining, EmbedModel, SearchAssignment, SearchCommand, SearchControlReply,
-        SearchMember, SearchMove, SearchRead, SearchReplica, SearchReport, SearchRole, SearchShard,
+        SearchMember, SearchMove, SearchRead, SearchReplica, SearchReport, SearchShard,
     },
     types::*,
 };
+#[cfg(test)]
+use crate::oltp_replication::search_rpc::SearchRole;
 use crate::oltp::mvcc::vector::ColumnId;
 use crate::protocol::{ErrorCode, Outcome, ProtocolError};
 use serde::{Deserialize, Serialize};
