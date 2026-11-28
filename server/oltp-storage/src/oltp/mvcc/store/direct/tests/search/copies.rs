@@ -801,3 +801,27 @@ async fn vs40_a_backup_refuses_cut_columns_that_are_not_the_ranges() {
         assert_eq!(error.code, ErrorCode::StorageUnavailable, "{name}");
     }
 }
+
+/// A backup with an explicitly plain cut omits columns fenced after it.
+#[tokio::test]
+async fn rvj_a_backup_of_a_table_plain_at_its_cut_omits_the_later_first_column() {
+    let mut s = S::plain(Some(&FaultFs::new())).await;
+    let write = s.write(1, None, Some(row(1, "a")), Vec::new());
+    assert_eq!(s.direct(10, write).await, applied(10));
+    assert_eq!(page_at(&s, 10, None).await.1, None);
+    assert!(matches!(s.fence(vec![column(1, VectorKind::Dense, 2)]).await, SearchReply::Fenced { .. }));
+
+    // Epoch zero represents an explicitly plain Catalog cut.
+    let cut = SearchSchema {
+        epoch: 0, high: 0, columns: Vec::new(), serving: Vec::new(), text: Vec::new(),
+    };
+    let (backup, schema) = page_at(&s, 10, Some(cut)).await;
+    assert_eq!(schema, None);
+    let mut restored = restore_with_schema(&s, &backup, 10, 128, schema).await;
+    let plain_ddl = ParticipantCommand::DirectSchema(DirectSchemaFence {
+        authority: s.f.authority,
+        table_id: s.f.table,
+        change: DirectSchemaChange::Fence { lifecycle: Some(nabedra_rt::ids::uuid_v4()) },
+    });
+    assert!(matches!(restored.submit(plain_ddl).await, ParticipantReply::DirectSchema(_)));
+}

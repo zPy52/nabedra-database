@@ -203,3 +203,59 @@ fn vs14_range_status_counts_a_report_only_for_the_columns_it_names() {
     assert_eq!(status[0].ready, vec![3, 4]);
     assert_eq!(status[0].lag_ms, Some(5), "the syncing replica's lag does not count");
 }
+
+/// rv-j proof: SearchAssign `Report` needs the new replica caught up on its
+/// whole shard (`ws[w].whole`), but a report carries at most
+/// `MAX_REPORT_RANGES` ranges and Control does not know the table's ranges.
+/// A worker with 13 ranges sends its first 12, all ready; the 13th, still
+/// syncing, is in the next call. `move_ready` already holds, so the
+/// reconciler publishes the move.
+#[test]
+fn rvj_a_move_publishes_on_the_first_page_of_a_split_report() {
+    let table = id(1);
+    let members = [member(10, "a", SearchRole::Worker)];
+    let pending = begin_move(None, table, 0, mv(10, None, 1)).unwrap();
+    let mut first = report(10, table, 1, vec![(1, ColumnState::Ready)]);
+    first.ranges = (0..MAX_REPORT_RANGES as u128)
+        .map(|n| RangeReport { group_id: id(100 + n), ..first.ranges[0].clone() })
+        .collect();
+    let control = nabedra_rt::ids::uuid_v4();
+    record_report(control, 1, first).unwrap();
+    let held = reports(control, 1, table).unwrap();
+    assert_eq!(
+        reconcile(&pending, &members, &held),
+        None,
+        "range 13 of the shard has not reported ready yet"
+    );
+}
+
+/// rv-j proof: a report refused because leader memory is full removes the
+/// worker's earlier report (`record_report` takes it out of the map before
+/// the bound check) and leaves the range count at the bound, so the worker
+/// loses its ready ranges and later reports are refused although memory
+/// holds fewer ranges.
+#[test]
+fn rvj_a_refused_report_keeps_the_workers_earlier_report() {
+    let control = nabedra_rt::ids::uuid_v4();
+    let (table, other) = (id(1), id(2));
+    let one = report(10, table, 1, vec![(1, ColumnState::Ready)]);
+    record_report(control, 1, one.clone()).unwrap();
+    // Fill leader memory to the bound with other workers' reports.
+    let mut left = MAX_MEMORY_RANGES - 1;
+    let mut worker = 1_000u128;
+    while left > 0 {
+        let n = left.min(MAX_REPORT_RANGES);
+        let mut filler = report(worker, other, 1, vec![(1, ColumnState::Ready)]);
+        filler.ranges = (0..n as u128)
+            .map(|r| RangeReport { group_id: id(1_000_000 + worker * 16 + r), ..filler.ranges[0].clone() })
+            .collect();
+        record_report(control, 1, filler).unwrap();
+        left -= n;
+        worker += 1;
+    }
+    // Worker 10 reports a second range: one over the bound, refused.
+    let mut more = one.clone();
+    more.ranges[0].group_id = id(78);
+    assert!(record_report(control, 1, more).is_err());
+    assert_eq!(reports(control, 1, table).unwrap().len(), 1, "the earlier report of worker 10 is kept");
+}

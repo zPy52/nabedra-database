@@ -382,3 +382,23 @@ async fn vs14_a_table_drop_fences_its_ranges_first() {
     assert_eq!(dropped.high, 1, "ids stay used");
     runtime.drain().await.unwrap();
 }
+
+/// An unrelated DDL rolls a fenced drop forward before allocating its own column.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rvj_an_interrupted_drop_column_is_adopted_by_the_next_ddl() {
+    let path = std::env::temp_dir().join(format!("nabedra-search-adopt-{}", nabedra_rt::ids::uuid_v4()));
+    std::fs::create_dir(&path).unwrap();
+    let _cleanup = Cleanup(path.clone());
+    let (runtime, table, group) = ddl_table(&path).await;
+    assert!(fenced(&fence(&runtime, &group, table, 2, Vec::new()).await));
+    assert_eq!(status(&runtime, table).await["v"]["state"], "ready");
+
+    run(&runtime, request("table.add_column", json!({
+        "table_id":table,"name":"w","type":{"type":"vector","dim":3}
+    }))).await;
+    let columns = status(&runtime, table).await;
+    assert!(columns.get("v").is_none());
+    assert_eq!(columns["w"]["state"], "building");
+    assert_eq!(ids(&schema(&runtime, &group).await), (3, vec![2], vec![], vec![]));
+    runtime.drain().await.unwrap();
+}

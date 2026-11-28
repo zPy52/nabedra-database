@@ -214,3 +214,31 @@ async fn vs12_a_model_name_is_bound_for_life() {
     assert!(refused(&fixture.apply(search(SearchCommand::SetModel(endpoint))).await));
     assert_eq!(fixture.apply(search(SearchCommand::SetModel(first))).await, DONE);
 }
+
+/// rv-j proof: `SearchRead::Models` (an embedder's read of the registry)
+/// through the Control handle. `service/search.rs:198` scans 256 items per
+/// page, above the store's page bound of 128 (`pool.rs:1862`), so the read
+/// fails; the reconciler tick scans assignments and members the same way
+/// (`service/search.rs:230,235`).
+#[tokio::test]
+async fn rvj_the_model_registry_read_answers() {
+    let directory = Directory::new();
+    let (scope, pool) = identities();
+    let mut fixture = Fixture::open(&directory, scope, pool).await;
+    fixture.initialize().await;
+    assert_eq!(fixture.apply(search(SearchCommand::SetModel(model("m1", 8)))).await, DONE);
+    let consensus = Arc::new(NativeModelConsensus {
+        machine: fixture.machine.clone(),
+        next: AtomicU64::new(fixture.next),
+        reads: AtomicU64::new(0),
+    });
+    let handle = ControlHandle::new(
+        fixture.machine.clone(),
+        consensus,
+        OperatorPolicy { policy: authorization().policy, certificate_pins: Default::default() },
+    );
+    let read = handle.search_read(crate::oltp_replication::search_rpc::SearchRead::Models).await;
+    let bytes = read.expect("the model registry read answers");
+    let models: Vec<EmbedModel> = decode(bytes.as_ref()).unwrap();
+    assert_eq!(models.len(), 1);
+}
