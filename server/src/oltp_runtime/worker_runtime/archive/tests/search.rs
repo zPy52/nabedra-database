@@ -285,6 +285,9 @@ async fn vs15_a_queued_get_of_a_vector_table_is_served_before_and_after_its_fenc
 /// A lone runtime with `data.vector.v1` on and a table `docs` created with a
 /// dense column `v`, and the table's Data group (from a backup).
 async fn ddl_table(path: &Path) -> (Arc<WorkerRuntime>, Uuid, GroupIdentity) {
+    ddl_table_with_schema(path, json!({"id":"utf8","body":"utf8","v":{"type":"vector","dim":2}})).await
+}
+async fn ddl_table_with_schema(path: &Path, columns: Value) -> (Arc<WorkerRuntime>, Uuid, GroupIdentity) {
     let runtime = WorkerRuntime::open(&path.join("ddl"), "test", "search-ddl", execution(), resources())
         .await
         .unwrap();
@@ -294,7 +297,7 @@ async fn ddl_table(path: &Path) -> (Arc<WorkerRuntime>, Uuid, GroupIdentity) {
         &runtime,
         request(
             "table.create",
-            json!({"name":"docs","schema":{"id":"utf8","body":"utf8","v":{"type":"vector","dim":2}},
+            json!({"name":"docs","schema":columns,
                 "key":"id","format":"parquet"}),
         ),
     )
@@ -401,4 +404,39 @@ async fn rvj_an_interrupted_drop_column_is_adopted_by_the_next_ddl() {
     assert_eq!(columns["w"]["state"], "building");
     assert_eq!(ids(&schema(&runtime, &group).await), (3, vec![2], vec![], vec![]));
     runtime.drain().await.unwrap();
+}
+
+/// A plain Catalog record cannot hide an interrupted first search fence from index or drop DDL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vs14_an_interrupted_first_column_is_adopted_by_index_and_drop_ddl() {
+    use crate::oltp::mvcc::index::IndexDefinition;
+    use crate::oltp_replication::types::{Page, Text};
+
+    for index in [false, true] {
+        let path = std::env::temp_dir().join(format!("nabedra-first-fence-{}", nabedra_rt::ids::uuid_v4()));
+        std::fs::create_dir(&path).unwrap();
+        let _cleanup = Cleanup(path.clone());
+        let (runtime, table, group) = ddl_table_with_schema(&path, json!({"id":"utf8","body":"utf8"})).await;
+        assert!(fenced(&fence(&runtime, &group, table, 1, vec![dense(2)]).await));
+        assert_eq!(status(&runtime, table).await, json!({}));
+        if index {
+            runtime.create_index(
+                IndexDefinition {
+                    index_id: nabedra_rt::ids::uuid_v4(),
+                    table_id: table,
+                    name: Text::try_from("by_body").unwrap(),
+                    columns: Page::new(vec![Text::try_from("body").unwrap()]).unwrap(),
+                    covering: Page::new(Vec::new()).unwrap(),
+                },
+                nabedra_rt::ids::uuid_v4(),
+                1,
+            ).await.unwrap();
+            assert_eq!(status(&runtime, table).await["v"]["state"], "building");
+            assert_eq!(ids(&schema(&runtime, &group).await), (3, vec![1], vec![], vec![]));
+        } else {
+            run(&runtime, request("table.drop", json!({"table_id":table}))).await;
+            assert_eq!(ids(&schema(&runtime, &group).await), (2, vec![], vec![], vec![]));
+        }
+        runtime.drain().await.unwrap();
+    }
 }
