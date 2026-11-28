@@ -133,6 +133,7 @@ fn vs14_the_next_epoch_and_id_are_above_every_group() {
         high,
         serving: Vec::new(),
         text: Vec::new(),
+        names: Vec::new(),
     };
     for seed in 0..64u64 {
         let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
@@ -183,7 +184,7 @@ impl FakeState {
         use crate::oltp::mvcc::store::Fault;
         let (at, high) = self.schema.as_ref().map_or((0, 0), |s| (s.epoch, s.high));
         let installed = self.schema.as_ref().is_some_and(|s| {
-            s.epoch == fence.epoch && s.columns == fence.columns && s.serving == fence.serving && s.text == fence.text
+            fence.matches_schema(s)
         }) && self.lifecycle == fence.lifecycle;
         let direct = |lifecycle| Some(crate::oltp::mvcc::store::direct::DirectSchema { epoch: 1, lifecycle });
         if installed {
@@ -192,6 +193,9 @@ impl FakeState {
         if fence.expected_epoch != Some(at) || fence.epoch <= at {
             return SearchReply::Rejected(Fault::Conflict);
         }
+        if self.schema.as_ref().is_some_and(|schema| fence.reuses_id(schema)) {
+            return SearchReply::Rejected(Fault::InvalidBinding);
+        }
         let last = fence.columns.iter().map(|c| c.id).chain(fence.text.iter().map(|t| t.id)).max().unwrap_or(0);
         self.schema = Some(SearchSchema {
             epoch: fence.epoch,
@@ -199,6 +203,7 @@ impl FakeState {
             high: high.max(last),
             serving: fence.serving.clone(),
             text: fence.text.clone(),
+            names: fence.names.clone(),
         });
         self.lifecycle = fence.lifecycle;
         SearchReply::Fenced { epoch: fence.epoch, direct: direct(fence.lifecycle) }
@@ -226,16 +231,17 @@ impl FenceTarget for Arc<FakeGroup> {
         let reply = state.apply(&fence);
         Box::pin(async move { Ok(reply) })
     }
-    fn probe(&self) -> ResolveFuture<'_, Option<SearchSchema>> {
-        let schema = self.holds();
-        Box::pin(async move { Ok(schema) })
+    fn probe(&self) -> ResolveFuture<'_, SearchProbe> {
+        let state = self.state.lock().unwrap();
+        let probe = SearchProbe { schema: state.schema.clone(), lifecycle: state.lifecycle };
+        Box::pin(async move { Ok(probe) })
     }
 }
 fn template(serving: Vec<ColumnId>, lifecycle: Uuid) -> SearchFenceTemplate {
     let mut columns = vec![dense(2), dense(3)];
     columns[0].id = 1;
     columns[1].id = 2;
-    SearchFenceTemplate { lifecycle: Some(lifecycle), columns, serving, text: Vec::new() }
+    SearchFenceTemplate { lifecycle: Some(lifecycle), columns, serving, text: Vec::new(), names: Vec::new() }
 }
 /// Fences `groups` from `at` to `epoch` with `template`, as an earlier DDL.
 async fn fenced(groups: &[Arc<FakeGroup>], at: u64, epoch: u64, template: &SearchFenceTemplate) {
@@ -308,6 +314,87 @@ async fn vs14_l19_retries_are_bounded() {
     assert_eq!(error.code, ErrorCode::Conflict);
     assert_eq!(group.state.lock().unwrap().fences as u32, FENCE_TRIES);
     assert_ne!(group.holds().unwrap().serving, vec![2]);
+}
+
+/// L24: the newest fence ahead of the Catalog is the one to roll forward.
+/// Groups at the same ahead epoch must hold the same template under the same
+/// lifecycle, or the repair is a Conflict; groups at or below the Catalog's
+/// epoch are not ahead.
+#[tokio::test]
+async fn vs14_l24_two_lifecycles_at_one_ahead_epoch_conflict() {
+    let groups = [FakeGroup::new(), FakeGroup::new(), FakeGroup::new()];
+    let catalog = template(vec![1], nabedra_rt::ids::uuid_v4());
+    fenced(&groups, 0, 2, &catalog).await;
+    let probed = SearchGroups::probe(groups.to_vec()).await.unwrap();
+    assert!(probed.ahead(2).unwrap().is_none());
+    assert!(probed.require_repaired(2).is_ok());
+
+    let interrupted = template(vec![1, 2], nabedra_rt::ids::uuid_v4());
+    fenced(&groups[..2], 2, 3, &interrupted).await;
+    let probed = SearchGroups::probe(groups.to_vec()).await.unwrap();
+    let ahead = probed.ahead(2).unwrap().unwrap();
+    assert_eq!((ahead.schema.as_ref().unwrap().epoch, ahead.lifecycle), (3, interrupted.lifecycle));
+    assert_eq!(probed.require_repaired(2).unwrap_err().code, ErrorCode::Conflict);
+
+    let other = template(vec![1, 2], nabedra_rt::ids::uuid_v4());
+    fenced(&groups[2..], 2, 3, &other).await;
+    let probed = SearchGroups::probe(groups.to_vec()).await.unwrap();
+    assert_eq!(probed.ahead(2).unwrap_err().code, ErrorCode::Conflict);
+}
+
+/// L24: adoption fences every group behind the newest template to it at its
+/// own epoch, leaves the groups that hold it untouched, and stops as
+/// Overtaken when a group holds that epoch under another lifecycle.
+#[tokio::test]
+async fn vs14_l24_adoption_fences_the_groups_behind_to_the_newest_template() {
+    let table = nabedra_rt::ids::uuid_v4();
+    let groups = [FakeGroup::new(), FakeGroup::new()];
+    let catalog = template(vec![1], nabedra_rt::ids::uuid_v4());
+    fenced(&groups, 0, 2, &catalog).await;
+    let mut interrupted = template(vec![1], nabedra_rt::ids::uuid_v4());
+    interrupted.columns.truncate(1);
+    fenced(&groups[..1], 2, 3, &interrupted).await;
+    let mut probed = SearchGroups::probe(groups.to_vec()).await.unwrap();
+    assert!(fence_groups(&mut probed, table, 3, &interrupted, true).await.is_ok());
+    for group in &groups {
+        let held = group.holds().unwrap();
+        assert_eq!((held.epoch, held.columns.len()), (3, 1));
+    }
+    assert_eq!(groups[0].state.lock().unwrap().fences, 2, "the group that held it took no further fence");
+
+    let other = SearchFenceTemplate { lifecycle: Some(nabedra_rt::ids::uuid_v4()), ..interrupted.clone() };
+    let mut probed = SearchGroups::probe(groups.to_vec()).await.unwrap();
+    assert!(matches!(fence_groups(&mut probed, table, 3, &other, true).await, Err(FenceStop::Overtaken)));
+}
+
+/// rv-j F2 at the planner: after an interrupted `drop_column` the groups no
+/// longer hold id 2, and the fake group, like the store, refuses a fence
+/// that names it again. A step that checks `require_repaired` first stops
+/// as Conflict before it sends that fence.
+#[tokio::test]
+async fn vs14_l24_a_dropped_id_never_returns_and_the_step_asks_for_repair() {
+    let table = nabedra_rt::ids::uuid_v4();
+    let group = FakeGroup::new();
+    let catalog = template(vec![1, 2], nabedra_rt::ids::uuid_v4());
+    fenced(std::slice::from_ref(&group), 0, 2, &catalog).await;
+    let mut dropped = template(vec![1], nabedra_rt::ids::uuid_v4());
+    dropped.columns.truncate(1);
+    fenced(std::slice::from_ref(&group), 2, 3, &dropped).await;
+
+    let reply = group.fence(catalog.fence(table, 3, 4)).await.unwrap();
+    assert!(matches!(reply, SearchReply::Rejected(crate::oltp::mvcc::store::Fault::InvalidBinding)), "{reply:?}");
+    assert_eq!(group.holds().unwrap().epoch, 3);
+
+    let mut probed = SearchGroups::probe(vec![group.clone()]).await.unwrap();
+    let error = fence_search(&mut probed, table, 2, |groups| {
+        groups.require_repaired(2)?;
+        Ok((catalog.clone(), ()))
+    })
+    .await
+    .unwrap_err();
+    let PlanError::Protocol(error) = error else { panic!("{error:?}") };
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert_eq!(group.state.lock().unwrap().fences, 3, "no fence after the probe");
 }
 
 /// Groups with these schemas and no handles (the pure helpers read only the

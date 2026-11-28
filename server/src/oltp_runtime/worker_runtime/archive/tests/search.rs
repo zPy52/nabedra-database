@@ -8,7 +8,7 @@ use crate::oltp::{
     mvcc::{
         store::{
             ParticipantCommand, ParticipantReply,
-            search::{SearchFence, SearchReply, SearchSchema},
+            search::{SearchFence, SearchReply, SearchSchema, VectorName},
         },
         vector::{SearchColumn, VectorKind},
     },
@@ -102,6 +102,12 @@ async fn fence(
     let authority = handle.epochs().await.unwrap().authority;
     // L19: from the epoch the range holds now.
     let expected = handle.search_probe().await.unwrap().map_or(0, |schema| schema.epoch);
+    // L24: a fence names its vector columns as the planner does, so the next
+    // DDL can roll it forward. Every table here calls its vector `v`.
+    let names = columns
+        .iter()
+        .map(|column| VectorName { id: column.id, name: "v".try_into().unwrap(), model: None })
+        .collect();
     let command = OwnedCommand::new_owned(
         ParticipantCommand::SearchFence(SearchFence {
             authority,
@@ -113,6 +119,7 @@ async fn fence(
             columns,
             serving: Vec::new(),
             text: Vec::new(),
+            names,
         }),
         handle.resources(),
         ByteClass::Progress,

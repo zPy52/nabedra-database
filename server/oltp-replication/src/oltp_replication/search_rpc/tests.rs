@@ -122,6 +122,7 @@ fn schema() -> SearchSchema {
             language: text("english"),
             serving: false,
         }],
+        names: Vec::new(),
     }
 }
 fn published() -> PublishedColumn {

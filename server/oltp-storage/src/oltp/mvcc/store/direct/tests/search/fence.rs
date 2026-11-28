@@ -35,7 +35,7 @@ fn probe(s: &S) -> ParticipantCommand {
 }
 async fn schema(s: &mut S) -> Option<SearchSchema> {
     match search_reply(s.f.submit(probe(s)).await) {
-        SearchReply::Schema(schema) => schema.map(|schema| *schema),
+        SearchReply::Schema(probe) => probe.schema,
         other => panic!("{other:?}"),
     }
 }

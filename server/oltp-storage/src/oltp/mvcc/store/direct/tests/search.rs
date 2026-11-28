@@ -211,6 +211,7 @@ impl S {
             columns,
             serving: Vec::new(),
             text: Vec::new(),
+            names: Vec::new(),
         })
     }
     async fn fence(&mut self, columns: Vec<SearchColumn>) -> SearchReply {

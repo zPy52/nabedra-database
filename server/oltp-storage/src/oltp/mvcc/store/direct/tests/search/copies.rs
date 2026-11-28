@@ -591,6 +591,7 @@ async fn vs16_a_restore_refuses_vectors_that_do_not_fit_the_backups_columns() {
         high: MULTI,
         serving: Vec::new(),
         text: Vec::new(),
+        names: Vec::new(),
     };
     restore::check_schema(Some(&schema(columns())), &images).unwrap();
     // Another dimension, another kind, a column the backup does not have, none.
@@ -639,7 +640,7 @@ async fn vs16_the_first_search_fence_matches_the_restored_columns() {
     let write = s.write(1, None, Some(row(1, "a")), vec![s.set(PLAIN, s.dense(1))]);
     s.direct(10, write).await;
     let backed_up = images(&s, 10).await;
-    let schema = SearchSchema { epoch: 1, columns: columns(), high: 8, serving: Vec::new(), text: Vec::new() };
+    let schema = SearchSchema { epoch: 1, columns: columns(), high: 8, serving: Vec::new(), text: Vec::new(), names: Vec::new(), };
     let mut restored = restore_with_schema(&s, &backed_up, 10, 1, Some(schema)).await;
 
     let mut wrong = columns();
@@ -664,6 +665,7 @@ fn vs16_a_restore_refuses_malformed_search_metadata_before_reading_rows() {
         high: MULTI,
         serving: Vec::new(),
         text: Vec::new(),
+        names: Vec::new(),
     };
     assert!(restore::check_schema(Some(&checked), &[]).is_ok());
     let mut no_dimension = checked.clone();
@@ -715,7 +717,7 @@ async fn vs16_a_restore_refuses_an_undeclared_embedding_source() {
                 && !search.blobs.0.contains_key(&EMBEDDED)
         })
     }).unwrap();
-    let mut schema = SearchSchema { epoch: 1, columns: columns(), high: MULTI, serving: Vec::new(), text: Vec::new() };
+    let mut schema = SearchSchema { epoch: 1, columns: columns(), high: MULTI, serving: Vec::new(), text: Vec::new(), names: Vec::new(), };
     assert!(restore::check_schema(Some(&schema), &[image]).is_ok());
     schema.columns.retain(|column| column.id != EMBEDDED);
     let error = restore::check_schema(Some(&schema), &[image]).unwrap_err();
@@ -813,7 +815,7 @@ async fn rvj_a_backup_of_a_table_plain_at_its_cut_omits_the_later_first_column()
 
     // Epoch zero represents an explicitly plain Catalog cut.
     let cut = SearchSchema {
-        epoch: 0, high: 0, columns: Vec::new(), serving: Vec::new(), text: Vec::new(),
+        epoch: 0, high: 0, columns: Vec::new(), serving: Vec::new(), text: Vec::new(), names: Vec::new(),
     };
     let (backup, schema) = page_at(&s, 10, Some(cut)).await;
     assert_eq!(schema, None);
