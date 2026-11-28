@@ -447,12 +447,12 @@ pub(crate) fn record_report(control: Uuid, term: u64, report: SearchReport) -> R
                 return Err(invalid("search report pages disagree on page count"));
             }
         }
-        let old = memory.reports.remove(&key);
-        let before = old.as_ref().map_or(0, |old| old.ranges);
-        let mut next = old.filter(|_| same).unwrap_or_default();
-        let page_before = next.pages.get(&report.page).map_or(0, |page| page.ranges.len());
-        next.ranges = next.ranges - page_before + report.ranges.len();
-        let after = memory.ranges - before + next.ranges;
+        let before = old.map_or(0, |old| old.ranges);
+        let kept = old.filter(|_| same).map_or(0, |old| {
+            old.ranges - old.pages.get(&report.page).map_or(0, |page| page.ranges.len())
+        });
+        let next_ranges = kept + report.ranges.len();
+        let after = memory.ranges - before + next_ranges;
         if after > MAX_MEMORY_RANGES {
             return Err(ProtocolError::new(
                 ErrorCode::Overloaded,
@@ -460,9 +460,13 @@ pub(crate) fn record_report(control: Uuid, term: u64, report: SearchReport) -> R
                 Outcome::NotApplied,
             ));
         }
+        let next = memory.reports.entry(key).or_default();
+        if !same {
+            next.pages.clear();
+        }
+        next.ranges = next_ranges;
         next.pages.insert(report.page, report);
         memory.ranges = after;
-        memory.reports.insert(key, next);
         Ok(())
     })?
 }
