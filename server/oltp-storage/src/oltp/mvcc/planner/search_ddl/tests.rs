@@ -324,3 +324,79 @@ impl SchemasOnly {
         raise_high(self.0.iter().flatten(), search)
     }
 }
+
+/// A worker for the publish driver: Catalog tables with building columns,
+/// Control reports that a test changes between passes, and the publications.
+#[derive(Default)]
+struct FakePort {
+    tables: std::sync::Mutex<Vec<BuildingTable>>,
+    reports: std::sync::Mutex<Vec<(Uuid, RangeReadiness)>>,
+    published: std::sync::Mutex<Vec<(Uuid, ColumnId)>>,
+    fail: std::sync::Mutex<Vec<Uuid>>,
+}
+impl FakePort {
+    fn report(&self, table: Uuid, group_id: Uuid, ready: Vec<ColumnId>) {
+        self.reports.lock().unwrap().push((table, RangeReadiness { group_id, ready, ..RangeReadiness::default() }));
+    }
+    fn failover(&self) {
+        self.reports.lock().unwrap().clear();
+    }
+}
+impl PublishPort for FakePort {
+    fn building(&self) -> ResolveFuture<'_, Vec<BuildingTable>> {
+        let tables = self.tables.lock().unwrap().clone();
+        Box::pin(async move { Ok(tables) })
+    }
+    fn readiness(&self, table_id: Uuid) -> ResolveFuture<'_, Vec<RangeReadiness>> {
+        let reports = self.reports.lock().unwrap().iter().filter(|(t, _)| *t == table_id).map(|(_, r)| r.clone()).collect();
+        Box::pin(async move { Ok(reports) })
+    }
+    fn publish(&self, table_id: Uuid, column: ColumnId) -> ResolveFuture<'_, ()> {
+        let failed = self.fail.lock().unwrap().contains(&table_id);
+        if !failed {
+            self.published.lock().unwrap().push((table_id, column));
+            for table in self.tables.lock().unwrap().iter_mut().filter(|t| t.table_id == table_id) {
+                table.building.retain(|c| *c != column);
+            }
+        }
+        Box::pin(async move {
+            if failed { Err(conflict("a split holds a range")) } else { Ok(()) }
+        })
+    }
+}
+
+/// IndexLifecycle `BuildTerminates` and `ReportAgain` at the driver (the
+/// worker side of mutant `no_build_retry` is W's): nothing publishes while a
+/// range has no ready report; a report lost, or emptied by a Control
+/// failover, and sent again publishes on a later pass; a table whose
+/// publication fails is tried again and never holds back another table.
+#[tokio::test]
+async fn vs14_the_publish_driver_retries_every_pass_until_the_build_publishes() {
+    let (a, b) = (nabedra_rt::ids::uuid_v4(), nabedra_rt::ids::uuid_v4());
+    let (r1, r2, r3) = (nabedra_rt::ids::uuid_v4(), nabedra_rt::ids::uuid_v4(), nabedra_rt::ids::uuid_v4());
+    let port = FakePort::default();
+    *port.tables.lock().unwrap() = vec![
+        BuildingTable { table_id: a, groups: vec![r1, r2], building: vec![3] },
+        BuildingTable { table_id: b, groups: vec![r3], building: vec![2] },
+    ];
+    port.report(a, r1, vec![3]);
+    assert_eq!(publish_tick(&port).await.unwrap(), 0, "a range of a is not ready");
+    // Table b is ready, but its publication fails this pass.
+    port.fail.lock().unwrap().push(b);
+    port.report(b, r3, vec![2]);
+    assert!(publish_tick(&port).await.is_err());
+    port.fail.lock().unwrap().clear();
+    // Control fails over before r2's report reaches it; the workers report again.
+    port.failover();
+    assert_eq!(publish_tick(&port).await.unwrap(), 0);
+    port.report(a, r1, vec![3]);
+    port.report(a, r2, vec![3]);
+    port.report(b, r3, vec![2]);
+    assert_eq!(publish_tick(&port).await.unwrap(), 2);
+    let mut published = port.published.lock().unwrap().clone();
+    published.sort();
+    let mut want = vec![(a, 3), (b, 2)];
+    want.sort();
+    assert_eq!(published, want);
+    assert_eq!(publish_tick(&port).await.unwrap(), 0, "published once");
+}

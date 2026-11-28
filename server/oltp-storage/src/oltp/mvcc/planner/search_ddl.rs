@@ -801,6 +801,60 @@ impl NativePlanner {
     }
 }
 
+/// One search table with columns still to publish, as the publish driver
+/// sees it in the Catalog: its ranges at the current routing and its
+/// `Building` incarnations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuildingTable {
+    pub table_id: Uuid,
+    pub groups: Vec<Uuid>,
+    pub building: Vec<ColumnId>,
+}
+/// What the publish driver needs from its worker: the Catalog's building
+/// tables, Control's ready reports, and `plan_search_publish` committed as
+/// a metadata transaction.
+pub trait PublishPort: Send + Sync {
+    fn building(&self) -> ResolveFuture<'_, Vec<BuildingTable>>;
+    fn readiness(&self, table_id: Uuid) -> ResolveFuture<'_, Vec<RangeReadiness>>;
+    fn publish(&self, table_id: Uuid, column: ColumnId) -> ResolveFuture<'_, ()>;
+}
+/// One pass of the IndexLifecycle publish driver (`StartPublish`, liveness
+/// `BuildTerminates`): every pass reads the Catalog and Control's reports
+/// again and publishes each building incarnation that every range reported
+/// ready. It keeps nothing between passes, so a lost report, or a Control
+/// failover that emptied the reports, only delays a publication until the
+/// worker reports again; a failed publication is tried on the next pass,
+/// and one table's failure never holds back another's. Returns the columns
+/// published, or the first error if none was.
+pub async fn publish_tick(port: &dyn PublishPort) -> Result<usize, ProtocolError> {
+    let mut published = 0;
+    let mut first_error = None;
+    for table in port.building().await? {
+        let readiness = match port.readiness(table.table_id).await {
+            Ok(readiness) => readiness,
+            Err(error) => {
+                first_error.get_or_insert(error);
+                continue;
+            }
+        };
+        for column in &table.building {
+            if !all_ready(&table.groups, &readiness, *column) {
+                continue;
+            }
+            match port.publish(table.table_id, *column).await {
+                Ok(()) => published += 1,
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+    }
+    match first_error {
+        Some(error) if published == 0 => Err(error),
+        _ => Ok(published),
+    }
+}
+
 /// The fence of a DDL that keeps the columns (`prepare_lifecycle_fence`).
 pub(crate) enum LifecycleFence {
     Direct(Uuid),
