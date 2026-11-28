@@ -16,6 +16,8 @@ use crate::oltp::{
 };
 use crate::oltp_replication::authority::control::VECTOR_FEATURE;
 
+mod repair;
+
 struct Cleanup(PathBuf);
 impl Drop for Cleanup {
     fn drop(&mut self) {

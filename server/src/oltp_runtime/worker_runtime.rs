@@ -87,6 +87,8 @@ pub(crate) struct WorkerRuntime {
     retirement_cursor: Mutex<Option<u64>>,
     recovery_probe: Mutex<recovery::RecoveryProbe>,
     gates: Mutex<BTreeMap<Uuid, Weak<AsyncMutex<()>>>>,
+    /// Per search repair owner, the first repair attempt not known finished (rv-j3 N1).
+    search_repairs: Mutex<BTreeMap<Uuid, u64>>,
     changed: Notify,
     admission_cleanup: admission_cleanup::AdmissionCleanup,
     accepting: AtomicBool,
@@ -232,6 +234,7 @@ impl WorkerRuntime {
             retirement_cursor: Mutex::new(None),
             recovery_probe: Mutex::new(recovery::RecoveryProbe::default()),
             gates: Mutex::new(BTreeMap::new()),
+            search_repairs: Mutex::new(BTreeMap::new()),
             changed: Notify::new(),
             admission_cleanup,
             accepting: AtomicBool::new(true),

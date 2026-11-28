@@ -55,13 +55,30 @@ impl WorkerRuntime {
         let catalog = &self.services.catalog;
         let probe_pin = catalog.snapshot(ReadTs::new(u64::MAX).map_err(|_| unknown())?, authority)?;
         let scope = catalog.participant().identity().group_id;
-        let owner_id = repair_uuid(serialized_digest(&(b"search-repair-owner/v1", scope, table_id))?);
+        let owner_id = repair_owner(scope, table_id)?;
         let gate = self.gate(owner_id)?;
         let _guard = gate.lock().await;
 
-        for retry in 0..3u8 {
-            let epoch = match self.planner.search_repair_epoch(&probe_pin, table_id).await {
-                Ok(Some(epoch)) => epoch,
+        // rv-j3 N1: every attempt takes the next id of the run's sequence for
+        // the table, so failures never use the ids up. A finished id is
+        // skipped; one that stopped before it finished resumes. The gate
+        // serializes attempts; the cursor only skips finished ids.
+        let mut attempt = self.search_repairs.lock().map_err(|_| unknown())?.get(&owner_id).copied().unwrap_or(1);
+        let mut tries = 0u8;
+        loop {
+            let (id, digest, maintenance) = search_repair_attempt(authority.run_id, scope, table_id, attempt)?;
+            let reservation_digest = metadata_digest(id, digest, maintenance)?;
+            if let Some(IdentityLookup::Terminal(_)) = self.services.status.lookup_identity(id, Some(reservation_digest)).await? {
+                attempt = attempt.checked_add(1).ok_or_else(unknown)?;
+                self.search_repairs.lock().map_err(|_| unknown())?.insert(owner_id, attempt);
+                continue;
+            }
+            if tries == 3 {
+                break;
+            }
+            tries += 1;
+            match self.planner.search_repair_epoch(&probe_pin, table_id).await {
+                Ok(Some(_)) => {}
                 Ok(None) => return Ok(()),
                 Err(PlanError::Blocked(intent)) => {
                     self.help_intent(intent).await?;
@@ -69,19 +86,6 @@ impl WorkerRuntime {
                 }
                 Err(PlanError::Protocol(error)) => return Err(error),
                 Err(_) => return Err(unknown()),
-            };
-            let maintenance = MaintenanceOwnerRef {
-                catalog_group_id: scope,
-                table_id,
-                index_id: owner_id,
-                build_id: owner_id,
-                attempt: epoch,
-            };
-            let digest = serialized_digest(&(b"search-repair/v1", authority.run_id, maintenance, retry))?;
-            let id = repair_uuid(digest);
-            let reservation_digest = metadata_digest(id, digest, maintenance)?;
-            if let Some(IdentityLookup::Terminal(_)) = self.services.status.lookup_identity(id, Some(reservation_digest)).await? {
-                continue;
             }
             let metadata = backend.begin(id, digest, maintenance, Some(id)).await?;
             let plan = match self.planner.plan_search_repair(
@@ -781,6 +785,31 @@ impl IndexBackend for RuntimeIndexes {
     }
 }
 
+fn repair_owner(scope: Uuid, table_id: Uuid) -> Result<Uuid, ProtocolError> {
+    Ok(repair_uuid(serialized_digest(&(b"search-repair-owner/v1", scope, table_id))?))
+}
+
+/// The `attempt`th (from 1) repair transaction of `table_id` in run `run_id`:
+/// its id, digest and owner. They are fixed, so a stopped attempt resumes on
+/// its id and a later repair finds it.
+fn search_repair_attempt(
+    run_id: Uuid,
+    scope: Uuid,
+    table_id: Uuid,
+    attempt: u64,
+) -> Result<(Uuid, Digest, MaintenanceOwnerRef), ProtocolError> {
+    let owner_id = repair_owner(scope, table_id)?;
+    let maintenance = MaintenanceOwnerRef {
+        catalog_group_id: scope,
+        table_id,
+        index_id: owner_id,
+        build_id: owner_id,
+        attempt,
+    };
+    let digest = serialized_digest(&(b"search-repair/v2", run_id, maintenance))?;
+    Ok((repair_uuid(digest), digest, maintenance))
+}
+
 fn repair_uuid(digest: Digest) -> Uuid {
     let mut id = [0; 16];
     id.copy_from_slice(&digest.as_bytes()[..16]);
@@ -811,6 +840,11 @@ fn check_ready_closure(
 
 #[cfg(test)]
 impl WorkerRuntime {
+    /// The production index backend, for tests that wrap it.
+    pub(super) fn index_backend_for_test(self: &Arc<Self>) -> Arc<dyn IndexBackend> {
+        Arc::new(RuntimeIndexes { runtime: self.clone(), authority: None })
+    }
+
     pub(crate) async fn run_index_fault_command(
         self: &Arc<Self>,
         command: super::super::recovery_tests::index_faults::Command,
