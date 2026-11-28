@@ -86,7 +86,7 @@ async fn stalled_declaration(
     runtime: &Arc<WorkerRuntime>,
     table: Uuid,
     crash: bool,
-) -> (Arc<Stalled>, tokio::task::JoinHandle<Result<(), ProtocolError>>) {
+) -> (Arc<Stalled>, nabedra_rt::task::JoinHandle<Result<(), ProtocolError>>) {
     let stalled = Arc::new(Stalled {
         runtime: runtime.clone(),
         inner: runtime.index_backend_for_test(),
@@ -102,7 +102,7 @@ async fn stalled_declaration(
         columns: Page::new(vec![Text::try_from("body").unwrap()]).unwrap(),
         covering: Page::new(Vec::new()).unwrap(),
     };
-    let build = tokio::spawn(async move { service.create(definition, nabedra_rt::ids::uuid_v4(), 1).await });
+    let build = nabedra_rt::task::spawn(async move { service.create(definition, nabedra_rt::ids::uuid_v4(), 1).await });
     nabedra_rt::time::timeout(std::time::Duration::from_secs(30), stalled.entered.notified())
         .await
         .expect("the declaration reaches its source pin");
@@ -179,7 +179,7 @@ async fn rvj3_the_next_repair_releases_the_pin_of_a_repair_stopped_after_its_dec
     let mut holds = index_holds::register(catalog);
     let repair = {
         let runtime = runtime.clone();
-        tokio::spawn(async move { runtime.repair_search_ddl(table, None).await })
+        nabedra_rt::task::spawn(async move { runtime.repair_search_ddl(table, None).await })
     };
     let wait = std::time::Duration::from_secs(30);
     let prepared = nabedra_rt::time::timeout(wait, holds.recv()).await.unwrap().unwrap();
