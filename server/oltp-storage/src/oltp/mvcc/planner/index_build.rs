@@ -298,6 +298,7 @@ impl NativePlanner {
         request: RequestBinding,
         previous: MaintenanceOwnerRef,
         phase: IndexPhase,
+        fenced_table: TableRecord,
         guard: VerifiedLifecycleGuard,
         owner: Arc<crate::oltp::pool::ScratchLease>,
     ) -> Result<MutationPlan, PlanError> {
@@ -343,7 +344,7 @@ impl NativePlanner {
             }
             let (table_version, table) =
                 value(self.catalog.describe(pin, previous.table_id).await?)?;
-            let table = table.ok_or_else(not_found)?;
+            table.ok_or_else(not_found)?;
             let closed_key = MvccKey::CatalogIndexClosed {
                 table_id: previous.table_id,
                 closure_id: closure_id(&previous)?,
@@ -374,7 +375,7 @@ impl NativePlanner {
                             table_id: previous.table_id,
                         },
                         expected_version: table_version,
-                        change: self.index_put(&table.with_lifecycle(txn.request_id))?,
+                        change: self.index_put(&fenced_table)?,
                     },
                     PreparedWrite {
                         key: closed_key,

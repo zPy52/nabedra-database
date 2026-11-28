@@ -1117,6 +1117,9 @@ impl WorkerRuntime {
             let mut request_binding = None;
             let accepted = async {
                 let (operation, owner) = self.decode_raw(reserved.body.clone()).await?;
+                if let Some(table_id) = index_backend::search_ddl_table(&operation.operation) {
+                    self.repair_search_ddl(table_id, expected).await?;
+                }
                 let storage_pin = self.admission.begin_snapshot(&reserved).await?;
                 pin = Some(storage_pin);
                 #[cfg(test)]

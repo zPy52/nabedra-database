@@ -74,6 +74,7 @@ impl ImageRequest {
             high: 0,
             serving: Vec::new(),
             text: Vec::new(),
+            names: Vec::new(),
         }
     }
 }

@@ -28,7 +28,95 @@ struct RuntimeIndexes {
     runtime: Arc<WorkerRuntime>,
     authority: Option<Authority>,
 }
+/// The table of a search column DDL, which L24 repairs first. `table.drop`
+/// is not one: it fences above every group whatever they hold.
+pub(super) fn search_ddl_table(operation: &protocol::Operation) -> Option<Uuid> {
+    use protocol::Operation;
+    match operation {
+        Operation::AddColumn(p) => Some(p.table_id),
+        Operation::DropColumn(p) => Some(p.table_id),
+        Operation::AddFullText(p) => Some(p.table_id),
+        Operation::DropFullText(p) => Some(p.table_id),
+        _ => None,
+    }
+}
+
 impl WorkerRuntime {
+    // Reuse the internal Catalog metadata transaction and settlement path
+    // used by online indexes. The reserved owner domain gives repair its
+    // own durable request, independent of the subsequent DDL's result.
+    pub(super) async fn repair_search_ddl(
+        self: &Arc<Self>,
+        table_id: Uuid,
+        expected: Option<Authority>,
+    ) -> Result<(), ProtocolError> {
+        let authority = self.index_authority(expected).await?;
+        let backend = RuntimeIndexes { runtime: self.clone(), authority: Some(authority) };
+        let catalog = &self.services.catalog;
+        let probe_pin = catalog.snapshot(ReadTs::new(u64::MAX).map_err(|_| unknown())?, authority)?;
+        let scope = catalog.participant().identity().group_id;
+        let owner_id = repair_uuid(serialized_digest(&(b"search-repair-owner/v1", scope, table_id))?);
+        let gate = self.gate(owner_id)?;
+        let _guard = gate.lock().await;
+
+        for retry in 0..3u8 {
+            let epoch = match self.planner.search_repair_epoch(&probe_pin, table_id).await {
+                Ok(Some(epoch)) => epoch,
+                Ok(None) => return Ok(()),
+                Err(PlanError::Blocked(intent)) => {
+                    self.help_intent(intent).await?;
+                    continue;
+                }
+                Err(PlanError::Protocol(error)) => return Err(error),
+                Err(_) => return Err(unknown()),
+            };
+            let maintenance = MaintenanceOwnerRef {
+                catalog_group_id: scope,
+                table_id,
+                index_id: owner_id,
+                build_id: owner_id,
+                attempt: epoch,
+            };
+            let digest = serialized_digest(&(b"search-repair/v1", authority.run_id, maintenance, retry))?;
+            let id = repair_uuid(digest);
+            let reservation_digest = metadata_digest(id, digest, maintenance)?;
+            if let Some(IdentityLookup::Terminal(_)) = self.services.status.lookup_identity(id, Some(reservation_digest)).await? {
+                continue;
+            }
+            let metadata = backend.begin(id, digest, maintenance, Some(id)).await?;
+            let plan = match self.planner.plan_search_repair(
+                &metadata.pin, metadata.txn, metadata.request, table_id, metadata.owner.clone()
+            ).await {
+                Ok(plan) => plan,
+                Err(error) => {
+                    let (cause, guards) = match error {
+                        PlanError::Guarded { cause, guards } => (*cause, guards),
+                        other => (other, Vec::new()),
+                    };
+                    let (error, pending) = match cause {
+                        PlanError::Protocol(error) => (error, None),
+                        PlanError::LifecyclePending(binding) => (
+                            ProtocolError::new(ErrorCode::Conflict, "a lifecycle change is in progress", Outcome::NotApplied),
+                            Some(binding),
+                        ),
+                        PlanError::Blocked(_) | PlanError::Guarded { .. } => (unknown(), None),
+                    };
+                    backend.fail(metadata, guards, pending, error.clone()).await?;
+                    if error.code == ErrorCode::Conflict {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            match backend.commit(metadata, plan).await? {
+                IndexCommitOutcome::Committed => return Ok(()),
+                IndexCommitOutcome::Aborted(error) if error.code == ErrorCode::Conflict => continue,
+                IndexCommitOutcome::Aborted(error) => return Err(error),
+            }
+        }
+        Err(ProtocolError::new(ErrorCode::Conflict, "search DDL recovery conflicted; retry the request", Outcome::NotApplied))
+    }
+
     pub(super) fn index_service(self: &Arc<Self>, authority: Option<Authority>) -> IndexService {
         IndexService::new(Arc::new(RuntimeIndexes {
             runtime: self.clone(),
@@ -324,6 +412,9 @@ impl IndexBackend for RuntimeIndexes {
             self.runtime.index_authority(self.authority).await?;
             Ok(())
         })
+    }
+    fn repair_search_ddl(&self, table_id: Uuid) -> ResolveFuture<'_, ()> {
+        Box::pin(self.runtime.repair_search_ddl(table_id, self.authority))
     }
     fn begin(
         &self,
@@ -688,6 +779,15 @@ impl IndexBackend for RuntimeIndexes {
                 .await
         })
     }
+}
+
+fn repair_uuid(digest: Digest) -> Uuid {
+    let mut id = [0; 16];
+    id.copy_from_slice(&digest.as_bytes()[..16]);
+    // Custom UUID version and RFC variant, outside randomly issued v4 IDs.
+    id[6] = (id[6] & 0x0f) | 0x80;
+    id[8] = (id[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(id)
 }
 
 fn metadata_digest(job: Uuid, digest: Digest, owner: MaintenanceOwnerRef) -> Result<Digest, ProtocolError> {

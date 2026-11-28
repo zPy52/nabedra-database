@@ -25,7 +25,24 @@ pub struct SearchSchema {
     pub serving: Vec<ColumnId>,
     /// The full-text columns, ids from the same never-reused space (`high`).
     pub text: Vec<TextColumn>,
+    /// Catalog identities of vector columns, retained for DDL recovery.
+    pub names: Vec<VectorName>,
 }
+/// The Catalog metadata absent from the storage definition of a vector.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VectorName {
+    pub id: ColumnId,
+    pub name: Text<64>,
+    pub model: Option<Text<64>>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchProbe {
+    pub schema: Option<SearchSchema>,
+    pub lifecycle: Option<Uuid>,
+}
+
 /// One full-text column of a search range (contract-w2 2.7). It has no
 /// stored vector; a worker builds its impact index from the row's text.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,7 +69,7 @@ impl SearchSchema {
         self.columns.iter().find(|column| column.id == id)
     }
     pub(super) fn heap_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + columns_bytes(&self.columns) + extra_bytes(&self.serving, &self.text)
+        std::mem::size_of::<Self>() + columns_bytes(&self.columns) + extra_bytes(&self.serving, &self.text) + names_bytes(&self.names)
     }
 }
 
@@ -109,9 +126,7 @@ impl SplitSearch {
             .is_some_and(|source| source.statement.read_ts == read_ts)
     }
     pub(super) fn heap_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + columns_bytes(&self.schema.columns)
-            + extra_bytes(&self.schema.serving, &self.schema.text)
+        std::mem::size_of::<Self>() - std::mem::size_of::<SearchSchema>() + self.schema.heap_bytes()
     }
 }
 
@@ -141,10 +156,11 @@ pub struct SearchFence {
     pub serving: Vec<ColumnId>,
     /// As `SearchSchema::text`: ascending ids, none shared with `columns`.
     pub text: Vec<TextColumn>,
+    pub names: Vec<VectorName>,
 }
 impl SearchFence {
     pub(super) fn heap_bytes(&self) -> usize {
-        columns_bytes(&self.columns) + extra_bytes(&self.serving, &self.text)
+        columns_bytes(&self.columns) + extra_bytes(&self.serving, &self.text) + names_bytes(&self.names)
     }
     /// The shape rules a fence must meet before apply compares it with the
     /// group's schema: ascending unique ids, a published subset, at most
@@ -168,6 +184,12 @@ impl SearchFence {
                     && self.columns.iter().all(|column| column.id != text.id)
             })
             && self.columns.iter().all(|column| column.id != 0)
+            && (self.names.is_empty() || self.names.len() == self.columns.len()
+                && self.names.iter().zip(&self.columns).all(|(name, column)| {
+                    name.id == column.id
+                        && crate::protocol::validate_identifier(name.name.as_str()).is_ok()
+                        && name.model.is_some() == column.source.is_some()
+                }))
     }
     /// No expected epoch and nothing else: read the group's schema through
     /// the log.
@@ -178,6 +200,30 @@ impl SearchFence {
             && self.serving.is_empty()
             && self.text.is_empty()
             && self.lifecycle.is_none()
+            && self.names.is_empty()
+    }
+    pub(crate) fn matches_schema(&self, schema: &SearchSchema) -> bool {
+        schema.epoch == self.epoch
+            && schema.columns == self.columns
+            && schema.serving == self.serving
+            && schema.text == self.text
+            && schema.names == self.names
+    }
+    /// An id keeps its definition and cannot return after being dropped.
+    pub(crate) fn reuses_id(&self, current: &SearchSchema) -> bool {
+        self.columns.iter().any(|column| {
+            match current.column(column.id) {
+                Some(existing) => existing != column,
+                None => column.id <= current.high,
+            }
+        }) || self.text.iter().any(|text| {
+            match current.text.iter().find(|old| old.id == text.id) {
+                Some(old) => old.column != text.column || old.language != text.language,
+                None => text.id <= current.high,
+            }
+        }) || self.names.iter().any(|name| {
+            current.names.iter().any(|old| old.id == name.id && old != name)
+        })
     }
     /// The highest id this fence names.
     fn last(&self) -> ColumnId {
@@ -192,6 +238,12 @@ fn columns_bytes(columns: &Vec<SearchColumn>) -> usize {
             .filter_map(|column| column.source.as_ref())
             .map(|source| source.capacity_bytes())
             .sum::<usize>()
+}
+fn names_bytes(names: &Vec<VectorName>) -> usize {
+    names.capacity() * std::mem::size_of::<VectorName>()
+        + names.iter().map(|name| {
+            name.name.capacity_bytes() + name.model.as_ref().map_or(0, Text::capacity_bytes)
+        }).sum::<usize>()
 }
 fn extra_bytes(serving: &Vec<ColumnId>, text: &Vec<TextColumn>) -> usize {
     serving.capacity() * std::mem::size_of::<ColumnId>()
@@ -219,9 +271,8 @@ pub enum SearchReply {
         epoch: u64,
         direct: Option<direct::DirectSchema>,
     },
-    /// The answer to a probe (`SearchFence::is_probe`): the group's schema,
-    /// `None` before its first fence.
-    Schema(Option<Box<SearchSchema>>),
+    /// The schema and lifecycle installed at the probe's log position.
+    Schema(Box<SearchProbe>),
     Closed {
         floor: CommitTs,
     },
@@ -302,6 +353,7 @@ pub(super) fn restored(
                 high: 0,
                 serving: Vec::new(),
                 text: Vec::new(),
+                names: Vec::new(),
             }));
         }
     }
@@ -330,8 +382,10 @@ pub(super) fn fence(
     // coordinator picks an epoch above every group's and checks what a
     // fence installed (`planner::search_ddl`).
     if command.is_probe() {
-        let schema = config.search.map(Box::new);
-        return reply(tx, SearchReply::Schema(schema));
+        return reply(tx, SearchReply::Schema(Box::new(SearchProbe {
+            schema: config.search,
+            lifecycle: config.direct_schema.and_then(|direct| direct.lifecycle),
+        })));
     }
     if frozen(&config) {
         return rejected(tx, Fault::SplitInProgress);
@@ -341,12 +395,7 @@ pub(super) fn fence(
         .as_ref()
         .map_or((0, 0), |schema| (schema.epoch, schema.high));
     // L19: a repeat of the installed fence answers like its first apply.
-    let installed = config.search.as_ref().is_some_and(|schema| {
-        schema.epoch == command.epoch
-            && schema.columns == command.columns
-            && schema.serving == command.serving
-            && schema.text == command.text
-    }) && config
+    let installed = config.search.as_ref().is_some_and(|schema| command.matches_schema(schema)) && config
         .direct_schema
         .is_some_and(|direct| direct.lifecycle == command.lifecycle);
     if installed {
@@ -364,21 +413,7 @@ pub(super) fn fence(
     {
         return rejected(tx, Fault::InvalidBinding);
     }
-    // An id names one incarnation of either kind: it keeps its definition and
-    // never returns once dropped. `serving` may grow or shrink freely.
-    let current = ready(&config);
-    let reused = command.columns.iter().any(|column| {
-        match current.and_then(|schema| schema.column(column.id)) {
-            Some(existing) => existing != column,
-            None => epoch != 0 && column.id <= high,
-        }
-    }) || command.text.iter().any(|text| {
-        match current.and_then(|schema| schema.text.iter().find(|old| old.id == text.id)) {
-            Some(old) => old.column != text.column || old.language != text.language,
-            None => epoch != 0 && text.id <= high,
-        }
-    });
-    if reused {
+    if ready(&config).is_some_and(|current| command.reuses_id(current)) {
         return rejected(tx, Fault::InvalidBinding);
     }
     let Some(direct) = direct::fenced(&config, command.lifecycle) else {
@@ -391,6 +426,7 @@ pub(super) fn fence(
         high: command.last().max(high),
         serving: command.serving.clone(),
         text: command.text.clone(),
+        names: command.names.clone(),
     });
     config.direct_schema = Some(direct);
     if encoded_length(&config, METADATA_BYTES).is_err() {

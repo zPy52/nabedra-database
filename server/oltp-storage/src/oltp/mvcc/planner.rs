@@ -675,7 +675,7 @@ impl NativePlanner {
                     let participant = self.resolver.participant(&route.group).await?;
                     let mut groups = search_ddl::SearchGroups::probe(vec![participant]).await?;
                     let (epoch, ()) = search_ddl::fence_search(&mut groups, id, 0, |groups| {
-                        Ok((groups.raise_high(search.clone()).template(Some(id)), ()))
+                        Ok((groups.raise_high(search.clone()).named_template(&descriptor, id)?, ()))
                     })
                     .await?;
                     search.epoch = epoch;
@@ -749,17 +749,18 @@ impl NativePlanner {
             )?;
             // Plan section 7: stop direct writers in the Data log before the
             // Catalog publishes the drop. The exclusive guard is held. A
-            // search table's groups give up their columns (`StartDrop`).
-            match table.search.as_ref() {
-                Some(search) => {
-                    let mut groups = self.search_groups(pin, id).await?;
-                    let template = super::catalog::CatalogSearch::empty().template(None);
-                    search_ddl::fence_search(&mut groups, id, search.epoch, |_| Ok((template.clone(), ())))
-                        .await?;
-                }
-                None => {
-                    self.fence_direct_writers(pin, id, None).await?;
-                }
+            // search table's groups give up their columns (`StartDrop`). A
+            // drop discards every column, so it needs no L24 roll-forward:
+            // it fences above every group, including one an interrupted
+            // first `add_column` left ahead of a plain Catalog record.
+            let mut groups = self.search_groups(pin, id).await?;
+            if table.search.is_some() || groups.any_search() {
+                let catalog_epoch = table.search.as_ref().map_or(0, |search| search.epoch);
+                let template = super::catalog::CatalogSearch::empty().template(None);
+                search_ddl::fence_search(&mut groups, id, catalog_epoch, |_| Ok((template.clone(), ())))
+                    .await?;
+            } else {
+                self.fence_direct_writers(pin, id, None).await?;
             }
             let writes = vec![
                 PreparedWrite {

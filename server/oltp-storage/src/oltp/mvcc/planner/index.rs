@@ -279,6 +279,7 @@ impl NativePlanner {
         request: RequestBinding,
         definition: IndexDefinition,
         phase: IndexPhase,
+        fenced_table: TableRecord,
         guard: VerifiedLifecycleGuard,
         owner: Arc<ScratchLease>,
     ) -> Result<MutationPlan, PlanError> {
@@ -418,7 +419,7 @@ impl NativePlanner {
                 PreparedWrite {
                     key: MvccKey::CatalogTable { table_id },
                     expected_version: table_version,
-                    change: self.index_put(&table.with_lifecycle(txn.request_id))?,
+                    change: self.index_put(&fenced_table)?,
                 },
             ]);
             let epochs = self.catalog.participant().epochs().await?;

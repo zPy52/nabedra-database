@@ -17,12 +17,17 @@
 //!   A `Conflict` re-probes that group; if another DDL overtook this one,
 //!   the step starts over from a fresh probe, a bounded number of times.
 //!
-//! A step that fails before its Catalog commit stays invisible: the Catalog
-//! keeps the previous columns, and the next DDL fences above it.
+//! L24: a DDL that fenced groups and never committed is rolled forward from
+//! the groups. Before the next search DDL takes its snapshot, the worker runs
+//! `plan_search_repair` in its own Catalog transaction: it adopts the newest
+//! fenced template (its fence names each vector column, `VectorName`), fences
+//! every group to it, and publishes it. Groups at one ahead epoch under two
+//! lifecycles are a Conflict. Every later step checks `require_repaired`.
+//! `table.drop` needs no repair: it fences above every group.
 use super::*;
 use crate::oltp::mvcc::{
     catalog::{CatalogSearch, CatalogSearchColumn, CatalogSearchKind, ColumnLife},
-    store::search::{SearchFence, SearchReply, SearchSchema, TextColumn},
+    store::search::{SearchFence, SearchProbe, SearchReply, SearchSchema, TextColumn, VectorName},
     vector::{ColumnId, MAX_SEARCH_COLUMNS, SearchColumn, VectorKind},
 };
 use crate::protocol::{ColumnType, Embed};
@@ -48,6 +53,7 @@ pub struct SearchFenceTemplate {
     pub columns: Vec<SearchColumn>,
     pub serving: Vec<ColumnId>,
     pub text: Vec<TextColumn>,
+    pub names: Vec<VectorName>,
 }
 impl SearchFenceTemplate {
     /// The fence of `epoch` for a group probed at `expected`. The authority
@@ -65,6 +71,7 @@ impl SearchFenceTemplate {
             columns: self.columns.clone(),
             serving: self.serving.clone(),
             text: self.text.clone(),
+            names: self.names.clone(),
         }
     }
 }
@@ -76,7 +83,7 @@ pub(crate) trait FenceTarget: Send + Sync {
     /// Proposes `fence` under the group's current run authority.
     fn fence(&self, fence: SearchFence) -> ResolveFuture<'_, SearchReply>;
     /// The group's search schema in log order.
-    fn probe(&self) -> ResolveFuture<'_, Option<SearchSchema>>;
+    fn probe(&self) -> ResolveFuture<'_, SearchProbe>;
 }
 impl FenceTarget for Arc<ParticipantHandle> {
     fn group_id(&self) -> Uuid {
@@ -85,8 +92,8 @@ impl FenceTarget for Arc<ParticipantHandle> {
     fn fence(&self, fence: SearchFence) -> ResolveFuture<'_, SearchReply> {
         Box::pin(self.search_fence(fence))
     }
-    fn probe(&self) -> ResolveFuture<'_, Option<SearchSchema>> {
-        Box::pin(self.search_probe())
+    fn probe(&self) -> ResolveFuture<'_, SearchProbe> {
+        Box::pin(self.search_lifecycle_probe())
     }
 }
 
@@ -128,6 +135,9 @@ fn invalid(message: &'static str) -> ProtocolError {
 }
 fn conflict(message: &'static str) -> ProtocolError {
     failure(ErrorCode::Conflict, message)
+}
+fn interrupted_drop() -> ProtocolError {
+    conflict("an interrupted table.drop fenced the table; retry the drop")
 }
 
 impl CatalogSearch {
@@ -248,6 +258,7 @@ impl CatalogSearch {
             high: self.high,
             serving: template.serving,
             text: template.text,
+            names: Vec::new(),
         }
     }
     /// What the groups must hold for this Catalog state: every vector column
@@ -259,6 +270,7 @@ impl CatalogSearch {
             columns: Vec::new(),
             serving: Vec::new(),
             text: Vec::new(),
+            names: Vec::new(),
         };
         for column in &self.columns {
             let ready = column.state == ColumnLife::Ready;
@@ -284,7 +296,91 @@ impl CatalogSearch {
         template.text.sort_by_key(|text| text.id);
         template
     }
+    pub(super) fn named_template(
+        &self,
+        descriptor: &TableDescriptor,
+        lifecycle: Uuid,
+    ) -> Result<SearchFenceTemplate, ProtocolError> {
+        let mut template = self.template(Some(lifecycle));
+        for column in &self.columns {
+            if matches!(&column.kind, CatalogSearchKind::Vector(_)) {
+                let model = descriptor.search.embed.get(column.name.as_str())
+                    .map(|embed| Text::try_from(embed.model.as_str()))
+                    .transpose().map_err(|_| invalid("invalid embedding model name"))?;
+                template.names.push(VectorName {
+                    id: column.id,
+                    name: Text::try_from(column.name.as_str()).map_err(|_| invalid("invalid column name"))?,
+                    model,
+                });
+            }
+        }
+        template.names.sort_by_key(|name| name.id);
+        Ok(template)
+    }
 }
+/// Reconstruct the descriptor and column incarnations of a fenced template.
+fn adopted_record(
+    table: &TableRecord,
+    schema: &SearchSchema,
+    lifecycle: Option<Uuid>,
+    high: ColumnId,
+) -> Result<TableRecord, ProtocolError> {
+    let mut descriptor = table.descriptor.clone();
+    descriptor.schema.retain(|_, ty| !ty.is_vector());
+    descriptor.search.embed.clear();
+    descriptor.search.full_text.clear();
+    let mut search = CatalogSearch { epoch: schema.epoch, high, columns: Vec::new() };
+    for vector in &schema.columns {
+        let named = schema.names.iter().find(|name| name.id == vector.id);
+        let retained = table.search.iter().flat_map(|search| &search.columns)
+            .find(|column| column.id == vector.id);
+        let name = named.map(|name| name.name.as_str()).or_else(|| retained.map(|old| old.name.as_str()))
+            .ok_or_else(|| invalid("a fenced vector lacks its Catalog column name"))?;
+        let dim = u16::try_from(vector.dim).map_err(|_| invalid("fenced vector dimension overflows"))?;
+        let ty = match vector.kind {
+            VectorKind::Dense => ColumnType::Vector(dim),
+            VectorKind::Sparse => ColumnType::SparseVector,
+            VectorKind::Multi => ColumnType::VectorList(dim),
+        };
+        if descriptor.schema.insert(name.to_owned(), ty).is_some() {
+            return Err(invalid("a fenced vector duplicates another column"));
+        }
+        if let Some(source) = &vector.source {
+            let model = named.and_then(|name| name.model.as_ref()).map(Text::as_str)
+                .or_else(|| table.descriptor.search.embed.get(name).map(|embed| embed.model.as_str()))
+                .ok_or_else(|| invalid("a fenced vector lacks its embedding model"))?;
+            descriptor.search.embed.insert(name.to_owned(), Embed {
+                source: source.as_str().to_owned(),
+                model: model.to_owned(),
+            });
+        }
+        search.columns.push(CatalogSearchColumn {
+            id: vector.id,
+            name: Text::try_from(name).map_err(|_| invalid("invalid fenced column name"))?,
+            kind: CatalogSearchKind::Vector(vector.clone()),
+            state: if schema.serving.contains(&vector.id) { ColumnLife::Ready } else { ColumnLife::Building },
+        });
+    }
+    for text in &schema.text {
+        if descriptor.search.full_text.insert(text.column.as_str().to_owned(), text.language.as_str().to_owned()).is_some() {
+            return Err(invalid("a fenced full-text column appears twice"));
+        }
+        search.columns.push(CatalogSearchColumn {
+            id: text.id,
+            name: text.column.clone(),
+            kind: CatalogSearchKind::FullText { column: text.column.clone(), language: text.language.clone() },
+            state: if text.serving { ColumnLife::Ready } else { ColumnLife::Building },
+        });
+    }
+    search.columns.sort_by_key(|column| column.id);
+    descriptor.validate()?;
+    Ok(TableRecord {
+        descriptor,
+        search: Some(search),
+        ..table.with_lifecycle(lifecycle.unwrap_or_default())
+    })
+}
+
 /// The stored definition of a vector column of this type.
 pub fn vector_column(ty: ColumnType, embed: Option<&Embed>) -> Result<SearchColumn, ProtocolError> {
     let (kind, dim) = match ty {
@@ -311,12 +407,12 @@ pub fn vector_column(ty: ColumnType, embed: Option<&Embed>) -> Result<SearchColu
 /// The Data groups of a search table and the schema each holds, probed
 /// through its log under the Exclusive guard.
 pub(crate) struct SearchGroups<G = Arc<ParticipantHandle>> {
-    groups: Vec<(G, Option<SearchSchema>)>,
+    groups: Vec<(G, SearchProbe)>,
 }
 impl<G: FenceTarget> SearchGroups<G> {
     pub(crate) async fn probe(targets: Vec<G>) -> Result<Self, ProtocolError> {
         let mut groups = Self {
-            groups: targets.into_iter().map(|target| (target, None)).collect(),
+            groups: targets.into_iter().map(|target| (target, SearchProbe { schema: None, lifecycle: None })).collect(),
         };
         groups.reprobe().await?;
         Ok(groups)
@@ -331,7 +427,41 @@ impl<G: FenceTarget> SearchGroups<G> {
         self.groups.iter().map(|(target, _)| target.group_id()).collect()
     }
     fn schemas(&self) -> impl Iterator<Item = &SearchSchema> {
-        self.groups.iter().filter_map(|(_, schema)| schema.as_ref())
+        self.groups.iter().filter_map(|(_, probe)| probe.schema.as_ref())
+    }
+    /// Some group holds a search schema, perhaps from an interrupted first
+    /// `add_column` the Catalog never named: it refuses the plain fence.
+    pub(crate) fn any_search(&self) -> bool {
+        self.schemas().next().is_some()
+    }
+    /// Select the newest installed template and reject ambiguity at any
+    /// ahead epoch. A range may have a different high-water id after a
+    /// partially installed fence, even when the templates agree.
+    fn ahead(&self, catalog_epoch: u64) -> Result<Option<&SearchProbe>, ProtocolError> {
+        let mut epochs: BTreeMap<u64, &SearchProbe> = BTreeMap::new();
+        for (_, probe) in &self.groups {
+            let Some(schema) = &probe.schema else { continue };
+            if schema.epoch <= catalog_epoch {
+                continue;
+            }
+            if let Some(prior) = epochs.insert(schema.epoch, probe) {
+                let same = prior.lifecycle == probe.lifecycle && prior.schema.as_ref().is_some_and(|prior| {
+                    prior.columns == schema.columns && prior.serving == schema.serving
+                        && prior.text == schema.text && prior.names == schema.names
+                });
+                if !same {
+                    return Err(conflict("Data groups fenced different search lifecycles at the same epoch"));
+                }
+            }
+        }
+        Ok(epochs.last_key_value().map(|(_, probe)| *probe))
+    }
+    pub(super) fn require_repaired(&self, catalog_epoch: u64) -> Result<(), ProtocolError> {
+        if self.ahead(catalog_epoch)?.is_some() {
+            Err(conflict("a newer search fence needs Catalog recovery; retry the DDL"))
+        } else {
+            Ok(())
+        }
     }
     pub(crate) fn next_epoch(&self, catalog: u64) -> Result<u64, ProtocolError> {
         next_epoch(self.schemas(), catalog)
@@ -384,17 +514,36 @@ pub(crate) async fn fence_all<G: FenceTarget>(
     epoch: u64,
     template: &SearchFenceTemplate,
 ) -> Result<(), FenceStop> {
+    fence_groups(groups, table_id, epoch, template, false).await
+}
+
+async fn fence_groups<G: FenceTarget>(
+    groups: &mut SearchGroups<G>,
+    table_id: Uuid,
+    epoch: u64,
+    template: &SearchFenceTemplate,
+    adopting: bool,
+) -> Result<(), FenceStop> {
     use crate::oltp::mvcc::store::Fault;
     let seen = groups.schemas().map(|schema| schema.high).max().unwrap_or(0);
-    for (target, schema) in &mut groups.groups {
+    for (target, probe) in &mut groups.groups {
         let (mut conflicts, mut splits) = (0, 0);
         let mut backoff = Duration::from_millis(50);
         loop {
-            let (at, high) = schema.as_ref().map_or((0, 0), |schema| (schema.epoch, schema.high));
-            if at >= epoch || high > seen {
+            let (at, high) = probe.schema.as_ref().map_or((0, 0), |schema| (schema.epoch, schema.high));
+            let fence = template.fence(table_id, at, epoch);
+            if high > seen {
                 return Err(FenceStop::Overtaken);
             }
-            match target.fence(template.fence(table_id, at, epoch)).await? {
+            if at >= epoch {
+                if adopting && probe.lifecycle == template.lifecycle
+                    && probe.schema.as_ref().is_some_and(|schema| fence.matches_schema(schema))
+                {
+                    break;
+                }
+                return Err(FenceStop::Overtaken);
+            }
+            match target.fence(fence).await? {
                 SearchReply::Fenced { epoch: applied, direct }
                     if applied == epoch
                         && direct.is_some_and(|direct| direct.lifecycle == template.lifecycle) =>
@@ -403,7 +552,10 @@ pub(crate) async fn fence_all<G: FenceTarget>(
                 }
                 SearchReply::Rejected(Fault::Conflict) if conflicts < FENCE_TRIES => {
                     conflicts += 1;
-                    *schema = target.probe().await?;
+                    *probe = target.probe().await?;
+                    if adopting {
+                        return Err(FenceStop::Overtaken);
+                    }
                 }
                 SearchReply::Rejected(Fault::Conflict) => {
                     return Err(FenceStop::Failed(Box::new(
@@ -507,6 +659,94 @@ impl NativePlanner {
         Ok(SearchGroups::probe(groups).await?)
     }
 
+    /// Find an interrupted DDL before reserving an internal repair transaction.
+    /// Its actual read and write are validated again at the transaction's pin.
+    pub async fn search_repair_epoch(
+        &self,
+        pin: &PinnedCatalog,
+        table_id: Uuid,
+    ) -> Result<Option<u64>, PlanError> {
+        let (_, record) = value(self.catalog.describe(pin, table_id).await?)?;
+        let Some(table) = record else { return Ok(None) };
+        let catalog_epoch = table.search.as_ref().map_or(0, |search| search.epoch);
+        let mut groups = self.search_groups(pin, table_id).await?;
+        for tries in 1..=FENCE_TRIES {
+            match groups.ahead(catalog_epoch) {
+                Ok(Some(probe)) if probe.lifecycle.is_none() => return Err(interrupted_drop().into()),
+                Ok(ahead) => return Ok(ahead.and_then(|probe| probe.schema.as_ref()).map(|schema| schema.epoch)),
+                Err(_) if tries < FENCE_TRIES => groups.reprobe().await?,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(conflict("Data groups fenced different search lifecycles at the same epoch").into())
+    }
+
+    /// Roll the latest Data fence forward, publishing it independently of
+    /// the user's operation, so later validation or execution can fail safely.
+    pub async fn plan_search_repair(
+        &self,
+        pin: &PinnedCatalog,
+        txn: TxnId,
+        request: RequestBinding,
+        table_id: Uuid,
+        owner: Arc<crate::oltp::pool::ScratchLease>,
+    ) -> Result<MutationPlan, PlanError> {
+        let (version, table) = value(self.catalog.describe(pin, table_id).await?)?;
+        let table = table.ok_or_else(not_found)?;
+        let guard = self.guard(pin, txn, request, table_id, version, table.schema_epoch, GuardMode::Exclusive).await?;
+        let planned = async {
+            let catalog_epoch = table.search.as_ref().map_or(0, |search| search.epoch);
+            let mut groups = self.search_groups(pin, table_id).await?;
+            for tries in 1..=FENCE_TRIES {
+                match groups.ahead(catalog_epoch) {
+                    Err(_) if tries < FENCE_TRIES => {}
+                    Err(error) => return Err(error.into()),
+                    Ok(None) => return Err(conflict("the Catalog already holds the search fence").into()),
+                    // A drop's fence names no lifecycle: only `table.drop` finishes it.
+                    Ok(Some(probe)) if probe.lifecycle.is_none() => return Err(interrupted_drop().into()),
+                    Ok(Some(probe)) => {
+                        let schema = probe.schema.as_ref().ok_or_else(|| conflict("the search probe is incomplete"))?;
+                        let epoch = schema.epoch;
+                        let template = SearchFenceTemplate {
+                            lifecycle: probe.lifecycle,
+                            columns: schema.columns.clone(),
+                            serving: schema.serving.clone(),
+                            text: schema.text.clone(),
+                            names: schema.names.clone(),
+                        };
+                        let high = groups.schemas().map(|schema| schema.high)
+                            .fold(table.search.as_ref().map_or(0, |search| search.high), u16::max);
+                        let record = adopted_record(&table, schema, probe.lifecycle, high)?;
+                        match fence_groups(&mut groups, table_id, epoch, &template, true).await {
+                            Ok(()) => return self.write_search_record(record, version, guard.clone(), owner.clone()).await,
+                            Err(FenceStop::Overtaken) => {}
+                            Err(FenceStop::Failed(error)) => return Err(*error),
+                        }
+                    }
+                }
+                if tries < FENCE_TRIES {
+                    groups.reprobe().await?;
+                }
+            }
+            Err(conflict("another search DDL fenced the table during recovery").into())
+        }.await;
+        planned.map_err(|cause| PlanError::Guarded { cause: Box::new(cause), guards: vec![guard] })
+    }
+
+    /// Fences a lifecycle before an online index captures its source cut.
+    pub(crate) async fn fence_index_source(
+        &self,
+        pin: &PinnedCatalog,
+        table_id: Uuid,
+        lifecycle: Uuid,
+    ) -> Result<TableRecord, PlanError> {
+        let (_, table) = value(self.catalog.describe(pin, table_id).await?)?;
+        let table = table.ok_or_else(not_found)?;
+        let (fence, record) = self.prepare_lifecycle_fence(pin, &table, lifecycle).await?;
+        self.run_lifecycle_fence(pin, table_id, fence).await?;
+        Ok(record)
+    }
+
     /// The fence and the next table record of a DDL that keeps the search
     /// columns (index publication and retirement): a direct schema fence for
     /// a plain table, a search fence of the same columns at a new epoch for a
@@ -518,12 +758,13 @@ impl NativePlanner {
         lifecycle: Uuid,
     ) -> Result<(LifecycleFence, TableRecord), PlanError> {
         let mut record = table.with_lifecycle(lifecycle);
+        let groups = self.search_groups(pin, table.descriptor.id).await?;
+        groups.require_repaired(table.search.as_ref().map_or(0, |search| search.epoch))?;
         let Some(search) = table.search.as_ref() else {
             return Ok((LifecycleFence::Direct(lifecycle), record));
         };
-        let groups = self.search_groups(pin, table.descriptor.id).await?;
         let epoch = groups.next_epoch(search.epoch)?;
-        let template = search.template(Some(lifecycle));
+        let template = search.named_template(&table.descriptor, lifecycle)?;
         if let Some(next) = record.search.as_mut() {
             next.epoch = epoch;
         }
@@ -612,7 +853,7 @@ impl NativePlanner {
             };
             let mut groups = self.search_groups(pin, id).await?;
             let next = self
-                .fence_step(&mut groups, id, current.epoch, txn, |groups| {
+                .fence_step(&mut groups, id, &current, &descriptor, txn, |groups| {
                     step(groups.raise_high(current.clone()))
                 })
                 .await?;
@@ -655,7 +896,7 @@ impl NativePlanner {
                 return Err(conflict("a range has no ready replica of the column yet").into());
             }
             let next = self
-                .fence_step(&mut groups, table_id, current.epoch, txn, |groups| {
+                .fence_step(&mut groups, table_id, &current, &table.descriptor, txn, |groups| {
                     groups.raise_high(current.clone()).publish(column)
                 })
                 .await?;
@@ -676,14 +917,15 @@ impl NativePlanner {
         &self,
         groups: &mut SearchGroups,
         table_id: Uuid,
-        catalog_epoch: u64,
+        current: &CatalogSearch,
+        descriptor: &TableDescriptor,
         txn: TxnId,
         next: impl Fn(&SearchGroups) -> Result<CatalogSearch, ProtocolError>,
     ) -> Result<CatalogSearch, PlanError> {
-        let lifecycle = Some(txn.request_id);
-        let (epoch, mut next) = fence_search(groups, table_id, catalog_epoch, |groups| {
+        let (epoch, mut next) = fence_search(groups, table_id, current.epoch, |groups| {
+            groups.require_repaired(current.epoch)?;
             let next = next(groups)?;
-            Ok((next.template(lifecycle), next))
+            Ok((next.named_template(descriptor, txn.request_id)?, next))
         })
         .await?;
         next.epoch = epoch;
@@ -701,12 +943,21 @@ impl NativePlanner {
         guard: VerifiedLifecycleGuard,
         owner: Arc<crate::oltp::pool::ScratchLease>,
     ) -> Result<MutationPlan, PlanError> {
-        let lifecycle = txn.request_id;
         let record = TableRecord {
-            descriptor: descriptor.clone(),
+            descriptor,
             search: Some(next),
-            ..table.with_lifecycle(lifecycle)
+            ..table.with_lifecycle(txn.request_id)
         };
+        self.write_search_record(record, version, guard, owner).await
+    }
+
+    async fn write_search_record(
+        &self,
+        record: TableRecord,
+        version: Option<CommitTs>,
+        guard: VerifiedLifecycleGuard,
+        owner: Arc<crate::oltp::pool::ScratchLease>,
+    ) -> Result<MutationPlan, PlanError> {
         let change = Change::Put(CanonicalJson::from_serializable(
             self.catalog.resources(),
             &record,
@@ -719,14 +970,14 @@ impl NativePlanner {
                 schema_epoch: epochs.schema_epoch,
                 routing_epoch: epochs.routing_epoch,
                 writes: vec![PreparedWrite {
-                    key: MvccKey::CatalogTable { table_id: descriptor.id },
+                    key: MvccKey::CatalogTable { table_id: record.descriptor.id },
                     expected_version: version,
                     change,
                 }],
                 guards: vec![guard.clone().into_sealed()],
             }],
             lifecycle: vec![guard],
-            result: serde_json::to_value(&descriptor).map_err(|_| not_found())?,
+            result: serde_json::to_value(&record.descriptor).map_err(|_| not_found())?,
             _owner: owner,
         })
     }
