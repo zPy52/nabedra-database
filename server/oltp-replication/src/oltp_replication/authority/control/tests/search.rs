@@ -242,3 +242,45 @@ async fn rvj_the_model_registry_read_answers() {
     let models: Vec<EmbedModel> = decode(bytes.as_ref()).unwrap();
     assert_eq!(models.len(), 1);
 }
+
+#[tokio::test]
+async fn vs12_control_bounds_the_number_of_model_names() {
+    let directory = Directory::new();
+    let (scope, pool) = identities();
+    let mut fixture = Fixture::open(&directory, scope, pool).await;
+    fixture.initialize().await;
+    for n in 0..256 {
+        assert_eq!(fixture.apply(search(SearchCommand::SetModel(model(&format!("m{n}"), 8)))).await, DONE);
+    }
+
+    let drop = SearchCommand::DropModel { name: Text::try_from("m0").unwrap() };
+    assert_eq!(fixture.apply(search(drop)).await, DONE);
+    assert!(refused(&fixture.apply(search(SearchCommand::SetModel(model("new", 8)))).await));
+    assert!(fixture.record::<Digest>(binding_key("new")).await.is_none());
+    assert_eq!(fixture.apply(search(SearchCommand::SetModel(model("m0", 8)))).await, DONE);
+}
+
+#[tokio::test]
+async fn vs12_control_keeps_the_model_registry_small_enough_to_read() {
+    const LIMIT: usize = 60 << 10;
+    let directory = Directory::new();
+    let (scope, pool) = identities();
+    let mut fixture = Fixture::open(&directory, scope, pool).await;
+    fixture.initialize().await;
+    let mut encoded = 2;
+    for n in 0.. {
+        let mut next = model(&format!("m{n}"), 8);
+        next.allow_hosts = vec![Text::try_from("x".repeat(253)).unwrap(); 16];
+        encoded += serde_json::to_vec(&next).unwrap().len() + usize::from(n != 0);
+        let reply = fixture.apply(search(SearchCommand::SetModel(next.clone()))).await;
+        if encoded > LIMIT {
+            assert!(refused(&reply));
+            assert!(fixture.record::<Digest>(binding_key(next.name.as_str())).await.is_none());
+            let drop = SearchCommand::DropModel { name: Text::try_from("m0").unwrap() };
+            assert_eq!(fixture.apply(search(drop)).await, DONE);
+            assert_eq!(fixture.apply(search(SearchCommand::SetModel(next))).await, DONE);
+            break;
+        }
+        assert_eq!(reply, DONE);
+    }
+}

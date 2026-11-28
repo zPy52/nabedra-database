@@ -313,3 +313,36 @@ fn rvj_a_refused_report_keeps_the_workers_earlier_report() {
     assert_eq!(reports(control, 1, table).unwrap(), [one, more]);
     assert!(reports(control, 2, table).unwrap().is_empty());
 }
+
+#[test]
+fn vs06_one_workers_reports_cannot_fill_control_memory() {
+    const LIMIT: usize = 1 << 13;
+    let control = nabedra_rt::ids::uuid_v4();
+    let ready = vec![(1, ColumnState::Ready)];
+    let mut left = LIMIT;
+    let mut table = 1;
+    while left > 0 {
+        let n = left.min(MAX_REPORT_RANGES);
+        let mut page = report(10, id(table), 1, ready.clone());
+        page.ranges = (0..n as u128)
+            .map(|r| RangeReport { group_id: id(1_000 + r), ..page.ranges[0].clone() })
+            .collect();
+        record_report(control, 1, page).unwrap();
+        left -= n;
+        table += 1;
+    }
+    let extra = SearchReport { process: id(99), ..report(10, id(table), 1, ready.clone()) };
+    let error = record_report(control, 1, extra).unwrap_err();
+    assert_eq!(error.code, ErrorCode::Overloaded, "other tables and a new process count against the worker");
+    assert!(reports(control, 1, id(table)).unwrap().is_empty());
+
+    let new_worker = report(11, id(table), 1, ready.clone());
+    record_report(control, 1, new_worker.clone()).unwrap();
+    assert_eq!(reports(control, 1, id(table)).unwrap(), [new_worker]);
+
+    let smaller = SearchReport { report_id: 2, ..report(10, id(1), 1, ready.clone()) };
+    record_report(control, 1, smaller).unwrap();
+    record_report(control, 1, report(10, id(table), 1, ready)).unwrap();
+    assert_eq!(reports(control, 1, id(table)).unwrap().len(), 2);
+    assert!(reports(control, 2, id(table)).unwrap().is_empty());
+}
