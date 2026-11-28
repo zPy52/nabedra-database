@@ -5,11 +5,17 @@
 use super::*;
 use crate::oltp_replication::{
     authority::control::search::{
-        assignment_key, begin_move, binding, binding_key, cancel, member_key, model_key, publish,
-        refused, valid_assignment, valid_member, valid_model,
+        MODEL_BOUND_PREFIX, SEARCH_MODEL_PREFIX, assignment_key, begin_move, binding,
+        binding_key, cancel, member_key, model_key, publish, refused, valid_assignment,
+        valid_member, valid_model,
     },
     search_rpc::{EmbedModel, SearchAssignment, SearchCommand, SearchControlReply, SearchMember, SearchRole},
 };
+
+// Name bindings survive a drop, so limit all names ever enrolled.
+const MAX_MODEL_NAMES: usize = 256;
+// The registry travels in one Control read (64 KiB reply limit).
+const MAX_MODEL_REGISTRY_BYTES: usize = 60 << 10;
 
 pub(super) fn apply(
     tx: &mut GroupTransaction<'_>,
@@ -126,13 +132,54 @@ fn set_model(
         return Ok(refused("invalid embedding model"));
     }
     let bound = binding(model);
-    match load::<Digest>(tx, &binding_key(model.name.as_str()))? {
-        Some(old) if old != bound => {
-            return Ok(refused("a model name is bound for life to its endpoint, model and dimensions"));
-        }
-        Some(_) => {}
-        None => save(tx, &binding_key(model.name.as_str()), &bound)?,
+    let binding_key = binding_key(model.name.as_str());
+    let old = load::<Digest>(tx, &binding_key)?;
+    if old.is_some_and(|old| old != bound) {
+        return Ok(refused("a model name is bound for life to its endpoint, model and dimensions"));
     }
-    save(tx, &model_key(model.name.as_str()), model)?;
+    if old.is_none() && !registry_fits(tx, MODEL_BOUND_PREFIX, MAX_MODEL_NAMES - 1, |_, _| 1)? {
+        return Ok(refused("too many embedding model names"));
+    }
+    let model_key = model_key(model.name.as_str());
+    let encoded = tx.encode_value(model)?;
+    // Two bytes for brackets, plus a comma and value for each other model.
+    let rest = MAX_MODEL_REGISTRY_BYTES.saturating_sub(encoded.len() + 2);
+    if encoded.len() + 2 > MAX_MODEL_REGISTRY_BYTES
+        || !registry_fits(tx, SEARCH_MODEL_PREFIX, rest, |key, bytes| {
+            usize::from(key != model_key) * (bytes.len() + 1)
+        })?
+    {
+        return Ok(refused("the embedding model registry is too large"));
+    }
+    if old.is_none() {
+        save(tx, &binding_key, &bound)?;
+    }
+    tx.put(&model_key, encoded.as_ref())?;
     Ok(SearchControlReply::Done { epoch: 0 })
+}
+
+/// Checks a registry-wide limit without retaining the scanned records. Stop
+/// after the first page that exceeds the remaining budget.
+fn registry_fits(
+    tx: &mut GroupTransaction<'_>,
+    prefix: &[u8],
+    mut remaining: usize,
+    mut cost: impl FnMut(&[u8], &[u8]) -> usize,
+) -> Result<bool, ProtocolError> {
+    let mut cursor = None;
+    loop {
+        let mut over = false;
+        let progress = tx.scan_page(prefix, cursor.as_deref(), 128, |key, bytes| {
+            if let Some(next) = remaining.checked_sub(cost(key, bytes)) {
+                remaining = next;
+            } else {
+                over = true;
+            }
+            Ok(())
+        })?;
+        if over || progress.exhausted {
+            return Ok(!over);
+        }
+        cursor = progress.last_key;
+    }
 }

@@ -40,6 +40,9 @@ pub const DRAIN_GRACE_MS: u64 = 30_000;
 pub const REPLICAS: usize = 2;
 /// Range reports one Control leader keeps in memory.
 const MAX_MEMORY_RANGES: usize = 1 << 16;
+/// Each page owns at least one range with bounded column count and error text,
+/// so charging ranges bounds the retained report memory across a worker's shards.
+const MAX_WORKER_RANGES: usize = 1 << 13;
 /// Shards and replicas of one assignment.
 const MAX_SHARDS: usize = 1024;
 const MAX_SHARD_REPLICAS: usize = 8;
@@ -401,6 +404,7 @@ struct Memory {
     /// The worker's latest snapshot for each `(table, worker, shard)`.
     reports: BTreeMap<(Uuid, Uuid, u32), ReportPages>,
     ranges: usize,
+    worker_ranges: BTreeMap<Uuid, usize>,
 }
 #[derive(Default)]
 struct ReportPages {
@@ -453,6 +457,15 @@ pub(crate) fn record_report(control: Uuid, term: u64, report: SearchReport) -> R
         });
         let next_ranges = kept + report.ranges.len();
         let after = memory.ranges - before + next_ranges;
+        let worker = report.worker_id;
+        let worker_after = memory.worker_ranges.get(&worker).copied().unwrap_or(0) - before + next_ranges;
+        if worker_after > MAX_WORKER_RANGES {
+            return Err(ProtocolError::new(
+                ErrorCode::Overloaded,
+                "Control holds too many search reports for this worker",
+                Outcome::NotApplied,
+            ));
+        }
         if after > MAX_MEMORY_RANGES {
             return Err(ProtocolError::new(
                 ErrorCode::Overloaded,
@@ -467,6 +480,7 @@ pub(crate) fn record_report(control: Uuid, term: u64, report: SearchReport) -> R
         next.ranges = next_ranges;
         next.pages.insert(report.page, report);
         memory.ranges = after;
+        memory.worker_ranges.insert(worker, worker_after);
         Ok(())
     })?
 }
