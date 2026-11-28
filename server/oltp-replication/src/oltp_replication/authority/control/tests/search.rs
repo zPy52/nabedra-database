@@ -267,20 +267,28 @@ async fn vs12_control_keeps_the_model_registry_small_enough_to_read() {
     let (scope, pool) = identities();
     let mut fixture = Fixture::open(&directory, scope, pool).await;
     fixture.initialize().await;
+    let large_model = |n| {
+        let mut model = model(&format!("m{n}"), 8);
+        model.allow_hosts = vec![Text::new("x".repeat(253)).unwrap(); 16];
+        model
+    };
     let mut encoded = 2;
-    for n in 0.. {
-        let mut next = model(&format!("m{n}"), 8);
-        next.allow_hosts = vec![Text::try_from("x".repeat(253)).unwrap(); 16];
+    for n in 0..256 {
+        let next = large_model(n);
         encoded += serde_json::to_vec(&next).unwrap().len() + usize::from(n != 0);
         let reply = fixture.apply(search(SearchCommand::SetModel(next.clone()))).await;
         if encoded > LIMIT {
             assert!(refused(&reply));
             assert!(fixture.record::<Digest>(binding_key(next.name.as_str())).await.is_none());
+            let mut replacement = large_model(n - 1);
+            replacement.max_rps = 11;
+            assert_eq!(fixture.apply(search(SearchCommand::SetModel(replacement))).await, DONE);
             let drop = SearchCommand::DropModel { name: Text::try_from("m0").unwrap() };
             assert_eq!(fixture.apply(search(drop)).await, DONE);
             assert_eq!(fixture.apply(search(SearchCommand::SetModel(next))).await, DONE);
-            break;
+            return;
         }
         assert_eq!(reply, DONE);
     }
+    panic!("the model registry never reached the byte limit");
 }

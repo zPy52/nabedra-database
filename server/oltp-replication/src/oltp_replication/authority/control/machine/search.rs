@@ -169,7 +169,7 @@ fn registry_fits(
     let mut cursor = None;
     loop {
         let mut over = false;
-        let progress = tx.scan_page(prefix, cursor.as_deref(), 128, |key, bytes| {
+        let progress = tx.scan_page(prefix, cursor.as_deref(), MAX_PAGE_ITEMS, |key, bytes| {
             if let Some(next) = remaining.checked_sub(cost(key, bytes)) {
                 remaining = next;
             } else {
