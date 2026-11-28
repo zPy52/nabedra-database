@@ -105,7 +105,19 @@ impl WorkerRuntime {
                         ),
                         PlanError::Blocked(_) | PlanError::Guarded { .. } => (unknown(), None),
                     };
+                    let (shared, unguarded) = (pending.clone(), guards.is_empty());
                     backend.fail(metadata, guards, pending, error.clone()).await?;
+                    // rv-j3 N2: before the retry, help what kept the guard:
+                    // the shared holders it waited on, or another DDL's
+                    // exclusive guard. A stopped holder is finished and its
+                    // guard released; a live one is left to its actor.
+                    if let Some(binding) = shared {
+                        backend.help_lifecycle(binding).await?;
+                    } else if unguarded && error.code == ErrorCode::Conflict
+                        && let Some(holder) = catalog.participant().lifecycle_exclusive(table_id).await?
+                    {
+                        self.help_lifecycle(holder).await?;
+                    }
                     if error.code == ErrorCode::Conflict {
                         continue;
                     }

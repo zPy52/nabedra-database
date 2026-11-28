@@ -139,3 +139,24 @@ async fn rvj3_a_table_recovers_after_more_than_three_failed_repairs() {
     assert_eq!(status(&runtime, table).await["w"]["state"], "building");
     runtime.drain().await.unwrap();
 }
+
+/// rv-j3 N2: a DDL that stopped after its Status failure, still holding the
+/// Exclusive guard over a range it fenced ahead, no longer blocks the next
+/// column DDL: on the guard's Conflict the repair helps the exclusive holder,
+/// which releases a failed holder's guard, and retries. Before, every
+/// repair conflicted until the run changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rvj3_a_crashed_guard_holder_does_not_block_the_next_column_ddl() {
+    let path = std::env::temp_dir().join(format!("nabedra-repair-help-{}", nabedra_rt::ids::uuid_v4()));
+    std::fs::create_dir(&path).unwrap();
+    let _cleanup = Cleanup(path.clone());
+    let (runtime, table, group) = ddl_table(&path).await;
+    let (stalled, build) = stalled_declaration(&runtime, table, true).await;
+    stalled.release.notify_one();
+    assert_eq!(build.await.unwrap().unwrap_err().outcome, Outcome::Unknown);
+    assert_eq!(ids(&schema(&runtime, &group).await), (2, vec![1], vec![1], vec![]));
+
+    run(&runtime, add(table, "w")).await;
+    assert_eq!(ids(&schema(&runtime, &group).await), (3, vec![1, 2], vec![1], vec![]));
+    runtime.drain().await.unwrap();
+}
