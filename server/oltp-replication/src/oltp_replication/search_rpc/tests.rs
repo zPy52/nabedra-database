@@ -737,6 +737,10 @@ fn vs00_control_and_catalog_types_round_trip_and_refuse_unknown_fields() {
             process: uuid(8),
             table_id: uuid(3),
             assignment_epoch: 2,
+            shard: 1,
+            report_id: 4,
+            page: 2,
+            pages: 3,
             ranges: vec![RangeReport {
                 group_id: uuid(2),
                 routing_epoch: 1,

@@ -916,6 +916,14 @@ pub struct SearchReport {
     pub process: Uuid,
     pub table_id: Uuid,
     pub assignment_epoch: u64,
+    /// Index in the table's assignment at `assignment_epoch`.
+    pub shard: u32,
+    /// Increases for each new snapshot of this shard within the process and epoch.
+    /// Retries use the same id and pages.
+    pub report_id: u64,
+    /// Zero-based page index and the total pages in this snapshot of the shard.
+    pub page: u16,
+    pub pages: u16,
     pub ranges: Vec<RangeReport>,
     pub queue: u32,
     pub memory_used: u64,

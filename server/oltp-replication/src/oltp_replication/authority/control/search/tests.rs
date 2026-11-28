@@ -28,6 +28,10 @@ fn report(worker: u128, table: Uuid, epoch: u64, columns: Vec<(ColumnId, ColumnS
         process: id(worker + 500),
         table_id: table,
         assignment_epoch: epoch,
+        shard: 0,
+        report_id: 1,
+        page: 0,
+        pages: 1,
         ranges: vec![RangeReport {
             group_id: id(77),
             routing_epoch: 1,
@@ -99,6 +103,7 @@ fn vs06_a_move_publishes_only_after_the_new_replica_reported_caught_up() {
         ("no report", vec![]),
         ("another worker", vec![report(11, table, 1, ready.clone())]),
         ("another epoch", vec![report(10, table, 0, ready.clone())]),
+        ("another shard", vec![SearchReport { shard: 1, ..report(10, table, 1, ready.clone()) }]),
         ("another table", vec![report(10, id(2), 1, ready.clone())]),
         ("a syncing column", vec![report(10, table, 1, vec![(1, ColumnState::Ready), (2, ColumnState::Syncing)])]),
         ("a failed column", vec![report(10, table, 1, vec![(1, ColumnState::Failed(Text::try_from("x").unwrap()))])]),
@@ -107,7 +112,22 @@ fn vs06_a_move_publishes_only_after_the_new_replica_reported_caught_up() {
         assert!(!move_ready(&pending, &reports), "{name}");
         assert_eq!(reconcile(&pending, &members, &reports), None, "{name}");
     }
-    let reports = vec![report(11, table, 1, vec![]), report(10, table, 1, ready)];
+    let mut first = report(10, table, 1, ready.clone());
+    first.pages = 2;
+    first.ranges = (0..MAX_REPORT_RANGES as u128)
+        .map(|n| RangeReport { group_id: id(100 + n), ..first.ranges[0].clone() })
+        .collect();
+    let mut last = report(10, table, 1, ready);
+    last.page = 1;
+    last.pages = 2;
+    let control = nabedra_rt::ids::uuid_v4();
+    // A retry of the last page cannot stand in for the other page.
+    for page in [&last, &last] {
+        record_report(control, 1, page.clone()).unwrap();
+        assert_eq!(reconcile(&pending, &members, &reports(control, 1, table).unwrap()), None);
+    }
+    record_report(control, 1, first).unwrap();
+    let reports = reports(control, 1, table).unwrap();
     assert!(move_ready(&pending, &reports));
     assert_eq!(
         reconcile(&pending, &members, &reports),
@@ -157,14 +177,15 @@ fn vs06_the_reconciler_fills_shards_across_zones_and_replaces_lost_workers() {
 fn vs14_reports_are_leader_memory_and_a_failover_loses_them() {
     let control = nabedra_rt::ids::uuid_v4();
     let table = id(1);
-    let first = report(10, table, 1, vec![(1, ColumnState::Ready)]);
+    let mut first = report(10, table, 1, vec![(1, ColumnState::Ready)]);
+    first.pages = 2;
     record_report(control, 1, first.clone()).unwrap();
     let mut other_range = first.clone();
+    other_range.page = 1;
     other_range.ranges[0].group_id = id(78);
     record_report(control, 1, other_range).unwrap();
     let held = reports(control, 1, table).unwrap();
-    assert_eq!(held.len(), 1);
-    assert_eq!(held[0].ranges.len(), 2, "same process: ranges merged");
+    assert_eq!(held.len(), 2, "both pages of the snapshot are held");
     let status = range_status(&held);
     assert_eq!(status.iter().map(|s| (s.group_id, s.ready.clone())).collect::<Vec<_>>(), [(id(77), vec![1]), (id(78), vec![1])]);
     // Failover.
@@ -179,6 +200,9 @@ fn vs14_reports_are_leader_memory_and_a_failover_loses_them() {
     assert!(range_status(&reports(control, 2, table).unwrap())[0].ready.is_empty());
     for (name, bad) in [
         ("nil worker", SearchReport { worker_id: Uuid::nil(), ..first.clone() }),
+        ("zero page count", SearchReport { pages: 0, ..first.clone() }),
+        ("page index out of range", SearchReport { page: first.pages, ..first.clone() }),
+        ("empty page", SearchReport { ranges: vec![], ..first.clone() }),
         ("too many ranges", SearchReport { ranges: vec![first.ranges[0].clone(); MAX_REPORT_RANGES + 1], ..first.clone() }),
         ("unsorted columns", report(10, table, 1, vec![(2, ColumnState::Ready), (1, ColumnState::Ready)])),
     ] {
@@ -204,28 +228,45 @@ fn vs14_range_status_counts_a_report_only_for_the_columns_it_names() {
     assert_eq!(status[0].lag_ms, Some(5), "the syncing replica's lag does not count");
 }
 
-/// rv-j proof: SearchAssign `Report` needs the new replica caught up on its
-/// whole shard (`ws[w].whole`), but a report carries at most
-/// `MAX_REPORT_RANGES` ranges and Control does not know the table's ranges.
-/// A worker with 13 ranges sends its first 12, all ready; the 13th, still
-/// syncing, is in the next call. `move_ready` already holds, so the
-/// reconciler publishes the move.
+/// A late page of a superseded snapshot cannot complete the current snapshot.
+/// A complete snapshot still waits if its thirteenth range is syncing.
 #[test]
-fn rvj_a_move_publishes_on_the_first_page_of_a_split_report() {
+fn rvj_a_move_waits_for_every_page_of_the_same_report() {
     let table = id(1);
     let members = [member(10, "a", SearchRole::Worker)];
     let pending = begin_move(None, table, 0, mv(10, None, 1)).unwrap();
     let mut first = report(10, table, 1, vec![(1, ColumnState::Ready)]);
+    first.pages = 2;
     first.ranges = (0..MAX_REPORT_RANGES as u128)
         .map(|n| RangeReport { group_id: id(100 + n), ..first.ranges[0].clone() })
         .collect();
+    let mut last = report(10, table, 1, vec![(1, ColumnState::Ready)]);
+    last.page = 1;
+    last.pages = 2;
     let control = nabedra_rt::ids::uuid_v4();
+    record_report(control, 1, first.clone()).unwrap();
+    assert_eq!(reconcile(&pending, &members, &reports(control, 1, table).unwrap()), None);
+
+    first.report_id += 1;
+    record_report(control, 1, first.clone()).unwrap();
+    let inconsistent = SearchReport { pages: 3, ..first.clone() };
+    assert!(record_report(control, 1, inconsistent).is_err());
+    record_report(control, 1, last.clone()).unwrap();
+    assert_eq!(reconcile(&pending, &members, &reports(control, 1, table).unwrap()), None);
+
+    last.report_id = first.report_id;
+    last.ranges[0].columns = vec![(1, ColumnState::Syncing)];
+    record_report(control, 1, last.clone()).unwrap();
+    assert_eq!(reconcile(&pending, &members, &reports(control, 1, table).unwrap()), None);
+
+    first.report_id += 1;
+    last.report_id = first.report_id;
+    last.ranges[0].columns = vec![(1, ColumnState::Ready)];
     record_report(control, 1, first).unwrap();
-    let held = reports(control, 1, table).unwrap();
+    record_report(control, 1, last).unwrap();
     assert_eq!(
-        reconcile(&pending, &members, &held),
-        None,
-        "range 13 of the shard has not reported ready yet"
+        reconcile(&pending, &members, &reports(control, 1, table).unwrap()),
+        Some(SearchCommand::Publish { table_id: table, expected_epoch: 0 })
     );
 }
 
@@ -238,7 +279,8 @@ fn rvj_a_move_publishes_on_the_first_page_of_a_split_report() {
 fn rvj_a_refused_report_keeps_the_workers_earlier_report() {
     let control = nabedra_rt::ids::uuid_v4();
     let (table, other) = (id(1), id(2));
-    let one = report(10, table, 1, vec![(1, ColumnState::Ready)]);
+    let mut one = report(10, table, 1, vec![(1, ColumnState::Ready)]);
+    one.pages = 2;
     record_report(control, 1, one.clone()).unwrap();
     // Fill leader memory to the bound with other workers' reports.
     let mut left = MAX_MEMORY_RANGES - 1;
@@ -255,6 +297,7 @@ fn rvj_a_refused_report_keeps_the_workers_earlier_report() {
     }
     // Worker 10 reports a second range: one over the bound, refused.
     let mut more = one.clone();
+    more.page = 1;
     more.ranges[0].group_id = id(78);
     assert!(record_report(control, 1, more).is_err());
     assert_eq!(reports(control, 1, table).unwrap().len(), 1, "the earlier report of worker 10 is kept");
