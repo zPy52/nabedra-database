@@ -51,6 +51,35 @@ impl SearchSchema {
     pub(super) fn column(&self, id: ColumnId) -> Option<&SearchColumn> {
         self.columns.iter().find(|column| column.id == id)
     }
+    pub(super) fn heap_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + columns_bytes(&self.columns) + extra_bytes(&self.serving, &self.text)
+    }
+}
+
+/// The group's config with the search columns of a backup's cut (rv-oltp
+/// F1). The Catalog commits a column operation only after it fenced every
+/// group, so each column of the cut is one the group holds with the same
+/// definition, or one it dropped since (id at most `high`), whose vectors
+/// stay stored. Anything else is not this group's history: refused.
+pub(super) fn at_cut(mut config: Config, cut: &SearchSchema) -> Result<Config, ProtocolError> {
+    let changed = || failure(ErrorCode::StorageUnavailable, "the search columns of the backup's cut are not this range's");
+    let current = ready(&config).ok_or_else(|| failure(ErrorCode::StorageUnavailable, row::COLUMNS_UNKNOWN))?;
+    let known = |id: ColumnId| id != 0 && id <= current.high;
+    let columns = cut.columns.iter().all(|column| match current.column(column.id) {
+        Some(held) => held == column,
+        None => known(column.id),
+    });
+    let text = cut.text.iter().all(|text| {
+        match current.text.iter().find(|held| held.id == text.id) {
+            Some(held) => held.column == text.column && held.language == text.language,
+            None => known(text.id),
+        }
+    });
+    if !cut.valid() || !columns || !text {
+        return Err(changed());
+    }
+    config.search = Some(cut.clone());
+    Ok(config)
 }
 /// What a split copies besides rows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,15 +116,24 @@ impl SplitSearch {
 }
 
 /// Sets the group's search columns and raises its direct epoch in one entry, so
-/// no commit that read the previous columns applies after it. It takes only a
-/// larger `epoch`: a late or repeated fence of an old Control leader changes
-/// nothing (DB-20).
+/// no commit that read the previous columns applies after it.
+///
+/// L19: a compare-and-set on the group's search epoch, with the semantics of
+/// DDL-FENCE's `DirectSchemaChange::Fence`. `expected_epoch: None` is the DDL
+/// coordinator's probe through the log. `Some(e)` installs `epoch` (above
+/// `e`) only while the group is at `e`; repeating the installed fence is a
+/// no-op; anything else is `Rejected(Conflict)`. So the epoch only grows, and
+/// a late fence of an interrupted DDL that picked the same epoch never
+/// installs other columns (DB-20).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SearchFence {
     pub authority: Authority,
     pub table_id: Uuid,
     pub epoch: u64,
+    /// The group's search epoch this fence was computed from (0 before the
+    /// first fence and after a restore); `None` for a probe.
+    pub expected_epoch: Option<u64>,
     /// As for `DirectSchemaChange::Fence`.
     pub lifecycle: Option<Uuid>,
     pub columns: Vec<SearchColumn>,
@@ -113,7 +151,7 @@ impl SearchFence {
     /// `MAX_SEARCH_COLUMNS` columns of both kinds, known analyzers.
     pub(crate) fn well_formed(&self) -> bool {
         let languages = crate::protocol::FULL_TEXT_LANGUAGES;
-        self.epoch != 0
+        self.expected_epoch.is_some_and(|expected| self.epoch > expected)
             && self.columns.len().saturating_add(self.text.len()) <= MAX_SEARCH_COLUMNS
             && self.columns.iter().all(SearchColumn::valid)
             && self.columns.is_sorted_by(|a, b| a.id < b.id)
@@ -131,9 +169,11 @@ impl SearchFence {
             })
             && self.columns.iter().all(|column| column.id != 0)
     }
-    /// Epoch 0 with nothing else: read the group's schema through the log.
+    /// No expected epoch and nothing else: read the group's schema through
+    /// the log.
     pub(crate) fn is_probe(&self) -> bool {
-        self.epoch == 0
+        self.expected_epoch.is_none()
+            && self.epoch == 0
             && self.columns.is_empty()
             && self.serving.is_empty()
             && self.text.is_empty()
@@ -300,9 +340,21 @@ pub(super) fn fence(
         .search
         .as_ref()
         .map_or((0, 0), |schema| (schema.epoch, schema.high));
-    if command.epoch <= epoch {
+    // L19: a repeat of the installed fence answers like its first apply.
+    let installed = config.search.as_ref().is_some_and(|schema| {
+        schema.epoch == command.epoch
+            && schema.columns == command.columns
+            && schema.serving == command.serving
+            && schema.text == command.text
+    }) && config
+        .direct_schema
+        .is_some_and(|direct| direct.lifecycle == command.lifecycle);
+    if installed {
         let direct = config.direct_schema;
         return reply(tx, SearchReply::Fenced { epoch, direct });
+    }
+    if command.expected_epoch != Some(epoch) {
+        return rejected(tx, Fault::Conflict);
     }
     // At the first fence a restored range binds the same column incarnations
     // that were used to validate its images, including full-text-only ranges.

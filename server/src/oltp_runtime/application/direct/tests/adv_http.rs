@@ -215,6 +215,11 @@ async fn adv_http_vector_tables_and_search_operations_wait_for_the_feature() {
             ),
         ] {
             let (_, error, submits) = send(path, operation, &payload).await;
+            // J serves the column operations and status through the queue.
+            if operation.starts_with("table.") {
+                assert_eq!((error.message.as_str(), submits), (STOPPED, 1), "{path} {operation}");
+                continue;
+            }
             assert_eq!(
                 error.code,
                 ErrorCode::UnsupportedOperation,

@@ -54,6 +54,14 @@ pub struct ImageRequest {
     pub after: Option<MvccKey>,
     pub max_items: u16,
     pub max_bytes: usize,
+    /// A backup's search columns at its cut: the Catalog's at the cut, which
+    /// its restore fences with. The page's columns and the images' vectors
+    /// follow them, not the range's current columns, so a column operation
+    /// that fences the range after the cut changes nothing in the backup
+    /// (VEC-G10, rv-oltp F1). `None` for a split copy, which a fence cannot
+    /// overtake (both hold the lifecycle guard), and for a plain table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<Box<search::SearchSchema>>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -110,6 +118,7 @@ impl OwnedPayload for ImageRequest {
             .map_or(0, MvccKey::heap_bytes)
             .checked_add(self.span.start.as_ref().map_or(0, key))
             .and_then(|n| n.checked_add(self.span.end.as_ref().map_or(0, key)))
+            .and_then(|n| n.checked_add(self.search.as_ref().map_or(0, |search| search.heap_bytes())))
             .ok_or_else(invalid)
     }
     fn attach_fields(&self, _: Arc<ScratchLease>) -> Result<(), ProtocolError> {
@@ -219,6 +228,10 @@ impl ParticipantMachine {
                         ));
                     }
                     lineage::validate_read(&config, request.read_ts)?;
+                    let config = match request.search.as_deref() {
+                        Some(cut) => search::at_cut(config, cut)?,
+                        None => config,
+                    };
                     #[cfg(feature = "sim")]
                     super::snapshot_probe(&group, request.read_ts);
                     // Heads first, then direct-commit dedup records, which

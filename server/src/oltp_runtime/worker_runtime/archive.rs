@@ -603,6 +603,19 @@ impl WorkerRuntime {
         } else {
             None
         };
+        // rv-oltp F1: a backup's images follow the search columns of the
+        // Catalog at its cut, which its restore fences with, not the range's
+        // current ones (a column operation may fence the range after the cut).
+        let search = match (catalog_cut, &scope.group.kind) {
+            (Some(pin), GroupKind::Data { table_id, .. }) => self
+                .native_catalog::<crate::oltp::mvcc::catalog::TableRecord>(
+                    pin,
+                    MvccKey::CatalogTable { table_id: *table_id },
+                )
+                .await?
+                .and_then(|table| table.search.as_ref().map(|search| Box::new(search.schema()))),
+            _ => None,
+        };
         let mut index = None;
         let mut count = 0u64;
         let mut searched = false;
@@ -621,6 +634,7 @@ impl WorkerRuntime {
                     after: after.clone(),
                     max_items: 128,
                     max_bytes: crate::oltp::mvcc::MAX_FIXED_COMMAND_BYTES,
+                    search: search.clone(),
                 },
                 &self.services.shared,
                 ByteClass::Data,

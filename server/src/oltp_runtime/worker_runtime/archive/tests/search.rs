@@ -100,11 +100,14 @@ async fn fence(
 ) -> ParticipantReply {
     let handle = runtime.services.resolver.participant(group).await.unwrap();
     let authority = handle.epochs().await.unwrap().authority;
+    // L19: from the epoch the range holds now.
+    let expected = handle.search_probe().await.unwrap().map_or(0, |schema| schema.epoch);
     let command = OwnedCommand::new_owned(
         ParticipantCommand::SearchFence(SearchFence {
             authority,
             table_id: table,
             epoch,
+            expected_epoch: Some(expected),
             // A created table's first lifecycle id is its table id.
             lifecycle: Some(table),
             columns,
@@ -275,4 +278,105 @@ async fn vs15_a_queued_get_of_a_vector_table_is_served_before_and_after_its_fenc
     assert!(fenced(&fence(&source, &group, table, 1, vec![dense(2)]).await));
     assert_eq!(run(&source, get("a")).await.1.result, Some(row));
     source.drain().await.unwrap();
+}
+
+// ---- Search DDL on a lone runtime (task J, contract-w2 2.6, IndexLifecycle) ----
+
+/// A lone runtime with `data.vector.v1` on and a table `docs` created with a
+/// dense column `v`, and the table's Data group (from a backup).
+async fn ddl_table(path: &Path) -> (Arc<WorkerRuntime>, Uuid, GroupIdentity) {
+    let runtime = WorkerRuntime::open(&path.join("ddl"), "test", "search-ddl", execution(), resources())
+        .await
+        .unwrap();
+    runtime.without_direct_for_test().await;
+    runtime.services.manager.cluster_features().enable(VECTOR_FEATURE);
+    let (_, created) = run(
+        &runtime,
+        request(
+            "table.create",
+            json!({"name":"docs","schema":{"id":"utf8","body":"utf8","v":{"type":"vector","dim":2}},
+                "key":"id","format":"parquet"}),
+        ),
+    )
+    .await;
+    let table: Uuid = created.result.as_ref().unwrap()["id"].as_str().unwrap().parse().unwrap();
+    let backup = path.join("created");
+    runtime.backup_native(&backup, owner(), None).await.unwrap();
+    let group = archived(&runtime, &backup, table).group;
+    (runtime, table, group)
+}
+/// The group's search schema in log order.
+async fn schema(runtime: &WorkerRuntime, group: &GroupIdentity) -> SearchSchema {
+    let handle = runtime.services.resolver.participant(group).await.unwrap();
+    handle.search_probe().await.unwrap().expect("a search range")
+}
+fn ids(schema: &SearchSchema) -> (u64, Vec<u16>, Vec<u16>, Vec<(u16, bool)>) {
+    (
+        schema.epoch,
+        schema.columns.iter().map(|column| column.id).collect(),
+        schema.serving.clone(),
+        schema.text.iter().map(|text| (text.id, text.serving)).collect(),
+    )
+}
+async fn status(runtime: &Arc<WorkerRuntime>, table: Uuid) -> Value {
+    let (_, reply) = run(runtime, request("table.search_status", json!({"table_id":table}))).await;
+    reply.result.unwrap()["columns"].clone()
+}
+
+/// IndexLifecycle `AddColumn`, `StartDrop`/`FinishDrop` and a re-add on a
+/// real lone runtime: `table.create` fences its range at epoch 1 with every
+/// column published; each column operation fences the range at a larger
+/// epoch before the Catalog commit, a new column is writable and not served
+/// (`building` in `table.search_status`), a dropped one leaves the range, and
+/// a re-added name is a new id that never names the old incarnation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vs14_column_operations_fence_the_range_before_the_catalog_names_them() {
+    let path = std::env::temp_dir().join(format!("nabedra-search-ddl-{}", nabedra_rt::ids::uuid_v4()));
+    std::fs::create_dir(&path).unwrap();
+    let _cleanup = Cleanup(path.clone());
+    let (runtime, table, group) = ddl_table(&path).await;
+    assert_eq!(ids(&schema(&runtime, &group).await), (1, vec![1], vec![1], vec![]));
+    assert_eq!(status(&runtime, table).await["v"]["state"], "ready");
+
+    let add = |name: &str| request("table.add_column", json!({"table_id":table,"name":name,"type":{"type":"vector","dim":3}}));
+    run(&runtime, add("w")).await;
+    assert_eq!(ids(&schema(&runtime, &group).await), (2, vec![1, 2], vec![1], vec![]));
+    let columns = status(&runtime, table).await;
+    assert_eq!((columns["v"]["state"].clone(), columns["w"]["state"].clone()), (json!("ready"), json!("building")));
+
+    run(&runtime, request("table.add_full_text", json!({"table_id":table,"column":"body","language":"english"}))).await;
+    assert_eq!(ids(&schema(&runtime, &group).await), (3, vec![1, 2], vec![1], vec![(3, false)]));
+
+    run(&runtime, request("table.drop_column", json!({"table_id":table,"name":"v"}))).await;
+    assert_eq!(ids(&schema(&runtime, &group).await), (4, vec![2], vec![], vec![(3, false)]));
+    assert!(status(&runtime, table).await.get("v").is_none());
+    let (_, described) = run(&runtime, request("table.describe", json!({"name":"docs"}))).await;
+    assert!(described.result.unwrap()["schema"].get("v").is_none(), "the Catalog dropped the name");
+
+    // A re-add is a new incarnation.
+    run(&runtime, add("v")).await;
+    let again = schema(&runtime, &group).await;
+    assert_eq!(ids(&again), (5, vec![2, 4], vec![], vec![(3, false)]));
+    assert_eq!(again.high, 4);
+
+    run(&runtime, request("table.drop_full_text", json!({"table_id":table,"column":"body"}))).await;
+    assert_eq!(ids(&schema(&runtime, &group).await), (6, vec![2, 4], vec![], vec![]));
+    runtime.drain().await.unwrap();
+}
+
+/// IndexLifecycle `StartDrop`/`FinishDrop` for the table, red for mutant
+/// `drop_without_fence`: `table.drop` of a search table fences its range
+/// with no columns before the Catalog publishes the drop, so no worker can
+/// pass a barrier for a column of the dropped table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vs14_a_table_drop_fences_its_ranges_first() {
+    let path = std::env::temp_dir().join(format!("nabedra-search-drop-{}", nabedra_rt::ids::uuid_v4()));
+    std::fs::create_dir(&path).unwrap();
+    let _cleanup = Cleanup(path.clone());
+    let (runtime, table, group) = ddl_table(&path).await;
+    run(&runtime, request("table.drop", json!({"table_id":table}))).await;
+    let dropped = schema(&runtime, &group).await;
+    assert_eq!(ids(&dropped), (2, vec![], vec![], vec![]));
+    assert_eq!(dropped.high, 1, "ids stay used");
+    runtime.drain().await.unwrap();
 }

@@ -1,5 +1,6 @@
 //! The DDL coordinator's two calls on a Data group of a search table
-//! (contract-w2 2.6): a `SearchFence`, and a probe that reads the group's
+//! (contract-w2 2.6): a `SearchFence` (a compare-and-set on the group's
+//! search epoch, L19), and a probe that reads the group's
 //! search schema through its log. Both are proposals, so a remote handle
 //! serves them like a local one.
 use super::*;
@@ -44,6 +45,7 @@ impl ParticipantHandle {
             authority: self.epochs().await?.authority,
             table_id,
             epoch: 0,
+            expected_epoch: None,
             lifecycle: None,
             columns: Vec::new(),
             serving: Vec::new(),

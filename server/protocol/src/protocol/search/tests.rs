@@ -1601,11 +1601,17 @@ fn vs00_check_served_refuses_every_search_operation_until_its_owner_flips_it() {
         ("query.rank_many", many.clone()),
     ] {
         let operation = parse_op(op, payload).unwrap();
+        // J flipped the column operations and `table.search_status`.
+        let served = op.starts_with("table.");
         for vector in [true, false] {
             for result in [
                 operation.check_served(vector),
                 operation.check_queued(vector),
             ] {
+                if served {
+                    assert!(result.is_ok(), "{op}: {result:?}");
+                    continue;
+                }
                 let error = result.unwrap_err();
                 assert_eq!(error.code, ErrorCode::UnsupportedOperation, "{op}");
                 assert_eq!(error.message, "the operation is not supported yet", "{op}");

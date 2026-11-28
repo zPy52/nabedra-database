@@ -162,6 +162,154 @@ fn vs14_the_next_epoch_and_id_are_above_every_group() {
         assert!(found.iter().flatten().all(|s| added.high > s.high), "seed {seed}");
     }
 }
+/// A Data group with the apply rule of `SearchFence` (L19): a probe reads the
+/// schema; a fence installs only from its expected epoch, a repeat of the
+/// installed one is a no-op, anything else is a Conflict. `late` holds
+/// fences of an interrupted DDL that land just before this group's next
+/// fence call, one per call.
+struct FakeGroup {
+    id: Uuid,
+    state: std::sync::Mutex<FakeState>,
+}
+#[derive(Default)]
+struct FakeState {
+    schema: Option<SearchSchema>,
+    lifecycle: Option<Uuid>,
+    late: Vec<SearchFence>,
+    fences: usize,
+}
+impl FakeState {
+    fn apply(&mut self, fence: &SearchFence) -> SearchReply {
+        use crate::oltp::mvcc::store::Fault;
+        let (at, high) = self.schema.as_ref().map_or((0, 0), |s| (s.epoch, s.high));
+        let installed = self.schema.as_ref().is_some_and(|s| {
+            s.epoch == fence.epoch && s.columns == fence.columns && s.serving == fence.serving && s.text == fence.text
+        }) && self.lifecycle == fence.lifecycle;
+        let direct = |lifecycle| Some(crate::oltp::mvcc::store::direct::DirectSchema { epoch: 1, lifecycle });
+        if installed {
+            return SearchReply::Fenced { epoch: at, direct: direct(self.lifecycle) };
+        }
+        if fence.expected_epoch != Some(at) || fence.epoch <= at {
+            return SearchReply::Rejected(Fault::Conflict);
+        }
+        let last = fence.columns.iter().map(|c| c.id).chain(fence.text.iter().map(|t| t.id)).max().unwrap_or(0);
+        self.schema = Some(SearchSchema {
+            epoch: fence.epoch,
+            columns: fence.columns.clone(),
+            high: high.max(last),
+            serving: fence.serving.clone(),
+            text: fence.text.clone(),
+        });
+        self.lifecycle = fence.lifecycle;
+        SearchReply::Fenced { epoch: fence.epoch, direct: direct(fence.lifecycle) }
+    }
+}
+impl FakeGroup {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { id: nabedra_rt::ids::uuid_v4(), state: Default::default() })
+    }
+    fn holds(&self) -> Option<SearchSchema> {
+        self.state.lock().unwrap().schema.clone()
+    }
+}
+impl FenceTarget for Arc<FakeGroup> {
+    fn group_id(&self) -> Uuid {
+        self.id
+    }
+    fn fence(&self, fence: SearchFence) -> ResolveFuture<'_, SearchReply> {
+        let mut state = self.state.lock().unwrap();
+        state.fences += 1;
+        if !state.late.is_empty() {
+            let late = state.late.remove(0);
+            state.apply(&late);
+        }
+        let reply = state.apply(&fence);
+        Box::pin(async move { Ok(reply) })
+    }
+    fn probe(&self) -> ResolveFuture<'_, Option<SearchSchema>> {
+        let schema = self.holds();
+        Box::pin(async move { Ok(schema) })
+    }
+}
+fn template(serving: Vec<ColumnId>, lifecycle: Uuid) -> SearchFenceTemplate {
+    let mut columns = vec![dense(2), dense(3)];
+    columns[0].id = 1;
+    columns[1].id = 2;
+    SearchFenceTemplate { lifecycle: Some(lifecycle), columns, serving, text: Vec::new() }
+}
+/// Fences `groups` from `at` to `epoch` with `template`, as an earlier DDL.
+async fn fenced(groups: &[Arc<FakeGroup>], at: u64, epoch: u64, template: &SearchFenceTemplate) {
+    for group in groups {
+        let reply = group.fence(template.fence(Uuid::nil(), at, epoch)).await.unwrap();
+        assert!(matches!(reply, SearchReply::Fenced { .. }), "{reply:?}");
+    }
+}
+
+/// L19, IndexLifecycle `SendFences`/`FenceRange`: an interrupted DDL probed
+/// the same epochs and picked the same next epoch with other columns; its
+/// late fence lands on one group first. This DDL's compare fails there, so
+/// it never reports a group as fenced that holds the other columns: it
+/// starts over above both and every group ends with its columns.
+#[tokio::test]
+async fn vs14_l19_an_overtaken_step_starts_over_above_the_late_fence() {
+    let table = nabedra_rt::ids::uuid_v4();
+    let groups = [FakeGroup::new(), FakeGroup::new()];
+    let old = template(vec![1], nabedra_rt::ids::uuid_v4());
+    fenced(&groups, 0, 2, &old).await;
+    let interrupted = template(vec![2], nabedra_rt::ids::uuid_v4());
+    groups[1].state.lock().unwrap().late.push(interrupted.fence(table, 2, 3));
+    let ours = template(vec![1, 2], nabedra_rt::ids::uuid_v4());
+    let mut probed = SearchGroups::probe(groups.to_vec()).await.unwrap();
+    let (epoch, ()) = fence_search(&mut probed, table, 2, |_| Ok((ours.clone(), ()))).await.unwrap();
+    assert_eq!(epoch, 4, "above the late fence's epoch");
+    for group in &groups {
+        let held = group.holds().unwrap();
+        assert_eq!((held.epoch, held.serving), (4, vec![1, 2]));
+    }
+}
+
+/// L19: a late fence below this step's epoch moved one group after the
+/// probe. The compare fails, the group is re-probed, and the fence is sent
+/// again from the epoch the group holds now; the step keeps its epoch.
+#[tokio::test]
+async fn vs14_l19_a_conflict_re_probes_the_group_and_keeps_the_epoch() {
+    let table = nabedra_rt::ids::uuid_v4();
+    let groups = [FakeGroup::new(), FakeGroup::new()];
+    let old = template(vec![1], nabedra_rt::ids::uuid_v4());
+    fenced(&groups[..1], 0, 5, &old).await;
+    fenced(&groups[1..], 0, 2, &old).await;
+    groups[1].state.lock().unwrap().late.push(old.fence(table, 2, 3));
+    let ours = template(vec![2], nabedra_rt::ids::uuid_v4());
+    let mut probed = SearchGroups::probe(groups.to_vec()).await.unwrap();
+    let (epoch, ()) = fence_search(&mut probed, table, 1, |_| Ok((ours.clone(), ()))).await.unwrap();
+    assert_eq!(epoch, 6);
+    assert_eq!(groups[1].state.lock().unwrap().fences, 3, "the earlier DDL's, the refused one, the retry");
+    for group in &groups {
+        assert_eq!(group.holds().unwrap().epoch, 6);
+    }
+}
+
+/// L19: the retries are bounded. A group that some other coordinator keeps
+/// moving fails the step with Conflict after `FENCE_TRIES` starts, and no
+/// group is left above what a Catalog commit would name.
+#[tokio::test]
+async fn vs14_l19_retries_are_bounded() {
+    let table = nabedra_rt::ids::uuid_v4();
+    let group = FakeGroup::new();
+    let other = template(vec![1], nabedra_rt::ids::uuid_v4());
+    // Before each of our fences another one lands at our epoch.
+    for epoch in 1..=8 {
+        group.state.lock().unwrap().late.push(other.fence(table, epoch - 1, epoch));
+    }
+    let ours = template(vec![2], nabedra_rt::ids::uuid_v4());
+    let mut probed = SearchGroups::probe(vec![group.clone()]).await.unwrap();
+    let error = fence_search(&mut probed, table, 0, |_| Ok((ours.clone(), ()))).await.unwrap_err();
+    let PlanError::Protocol(error) = error else { panic!("{error:?}") };
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert_eq!(group.state.lock().unwrap().fences as u32, FENCE_TRIES);
+    assert_ne!(group.holds().unwrap().serving, vec![2]);
+}
+
 /// Groups with these schemas and no handles (the pure helpers read only the
 /// schemas).
 fn epochs(found: &[Option<SearchSchema>]) -> SchemasOnly {

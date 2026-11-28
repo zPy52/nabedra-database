@@ -673,10 +673,11 @@ impl NativePlanner {
             let search = match super::catalog::CatalogSearch::of_descriptor(&descriptor)? {
                 Some(mut search) => {
                     let participant = self.resolver.participant(&route.group).await?;
-                    let groups = self.probe_groups(vec![participant]).await?;
-                    let epoch = groups.next_epoch(0)?;
-                    let template = groups.raise_high(search.clone()).template(Some(id));
-                    self.fence_search(&groups, id, epoch, &template).await?;
+                    let mut groups = search_ddl::SearchGroups::probe(vec![participant]).await?;
+                    let (epoch, ()) = search_ddl::fence_search(&mut groups, id, 0, |groups| {
+                        Ok((groups.raise_high(search.clone()).template(Some(id)), ()))
+                    })
+                    .await?;
                     search.epoch = epoch;
                     Some(search)
                 }
@@ -751,10 +752,10 @@ impl NativePlanner {
             // search table's groups give up their columns (`StartDrop`).
             match table.search.as_ref() {
                 Some(search) => {
-                    let groups = self.search_groups(pin, id).await?;
-                    let epoch = groups.next_epoch(search.epoch)?;
+                    let mut groups = self.search_groups(pin, id).await?;
                     let template = super::catalog::CatalogSearch::empty().template(None);
-                    self.fence_search(&groups, id, epoch, &template).await?;
+                    search_ddl::fence_search(&mut groups, id, search.epoch, |_| Ok((template.clone(), ())))
+                        .await?;
                 }
                 None => {
                     self.fence_direct_writers(pin, id, None).await?;
@@ -1199,6 +1200,11 @@ fn table_id(op: &Operation) -> Option<Uuid> {
         Operation::Get(p) | Operation::Delete(p) => Some(p.table_id),
         Operation::Update(p) => Some(p.table_id),
         Operation::Collect(p) | Operation::Count(p) | Operation::Explain(p) => Some(p.table_id),
+        Operation::AddColumn(p) => Some(p.table_id),
+        Operation::DropColumn(p) => Some(p.table_id),
+        Operation::AddFullText(p) => Some(p.table_id),
+        Operation::DropFullText(p) => Some(p.table_id),
+        Operation::SearchStatus(p) => Some(p.table_id),
         _ => None,
     }
 }

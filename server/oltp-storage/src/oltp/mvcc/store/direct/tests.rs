@@ -1392,6 +1392,7 @@ async fn d03_o19_dedup_records_survive_backup_images_and_restore() {
                 after: after.clone(),
                 max_items: 128,
                 max_bytes: 64 << 10,
+                search: None,
             },
             f.shared(),
             ByteClass::Data,

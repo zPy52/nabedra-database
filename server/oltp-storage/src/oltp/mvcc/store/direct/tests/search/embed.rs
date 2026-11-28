@@ -254,11 +254,14 @@ async fn vs14_a_column_id_is_one_incarnation_and_a_late_fence_changes_nothing() 
     let mut s = S::new().await;
     let epoch = s.epoch;
     put(&mut s, 1, None, 10, "a").await;
-    // A late or repeated fence of an old Control leader (DB-20).
+    // A late fence of an old Control leader expects an epoch the group left
+    // (DB-20, L19); the installed one repeated is a no-op.
     let before = s.f.dump().await;
     let late = s.fence_command(1, vec![]);
+    assert_eq!(search_reply(s.f.submit(late).await), refused(Fault::Conflict));
+    let repeated = s.fence_command(1, columns());
     assert!(matches!(
-        search_reply(s.f.submit(late).await),
+        search_reply(s.f.submit(repeated).await),
         SearchReply::Fenced { epoch: 1, direct: Some(direct) } if direct.epoch == epoch
     ));
     assert_eq!(s.f.dump().await, before);

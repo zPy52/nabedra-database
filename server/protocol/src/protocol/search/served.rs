@@ -6,10 +6,10 @@
 //! An operation that is not served is refused with `UnsupportedOperation`
 //! before any routing, on the direct and the queued path alike.
 
-pub(super) const ADD_COLUMN: bool = false; // J
-pub(super) const DROP_COLUMN: bool = false; // J
-pub(super) const ADD_FULL_TEXT: bool = false; // J
-pub(super) const DROP_FULL_TEXT: bool = false; // J
-pub(super) const SEARCH_STATUS: bool = false; // J
+pub(super) const ADD_COLUMN: bool = true; // J
+pub(super) const DROP_COLUMN: bool = true; // J
+pub(super) const ADD_FULL_TEXT: bool = true; // J
+pub(super) const DROP_FULL_TEXT: bool = true; // J
+pub(super) const SEARCH_STATUS: bool = true; // J
 pub(super) const RANK: bool = false; // I
 pub(super) const RANK_MANY: bool = false; // I
