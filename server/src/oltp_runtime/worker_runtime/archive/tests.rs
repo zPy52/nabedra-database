@@ -3,6 +3,7 @@
 use super::*;
 use crate::request_queue::{Receipt, RequestState};
 use serde_json::{Value, json};
+mod plain_cut;
 mod search;
 async fn run(runtime: &Arc<WorkerRuntime>, request: Value) -> (Vec<u8>, Receipt) {
     let body = serde_json::to_vec(&request).unwrap();

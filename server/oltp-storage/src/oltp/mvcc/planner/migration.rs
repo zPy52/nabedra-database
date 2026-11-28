@@ -38,7 +38,7 @@ impl NativePlanner {
             let page = derived_uuid(b"nabedra/import-route-page/v1", id, txn.request_id);
             let writes = self
                 .catalog
-                .create_writes(descriptor.clone(), route, page, &guard)?;
+                .create_writes(descriptor.clone(), route, page, &guard, None)?;
             let epochs = self.catalog.participant().epochs().await?;
             Ok(MutationPlan {
                 participants: vec![ParticipantWrites {

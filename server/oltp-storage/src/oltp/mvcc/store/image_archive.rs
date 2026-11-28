@@ -54,6 +54,29 @@ pub struct ImageRequest {
     pub after: Option<MvccKey>,
     pub max_items: u16,
     pub max_bytes: usize,
+    /// A backup's search columns at its cut: the Catalog's at the cut, which
+    /// its restore fences with. The page's columns and the images' vectors
+    /// follow them, not the range's current columns, so a column operation
+    /// that fences the range after the cut changes nothing in the backup
+    /// (VEC-G10, rv-oltp F1). For a plain Data table at the cut, use
+    /// `plain_search_cut()`. `None` copies the range's current schema for a
+    /// split, whose lifecycle guard prevents a concurrent fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<Box<search::SearchSchema>>,
+}
+impl ImageRequest {
+    /// Explicitly plain Catalog image at a backup cut. A fenced Catalog
+    /// search schema always has a nonzero epoch.
+    pub fn plain_search_cut() -> search::SearchSchema {
+        search::SearchSchema {
+            epoch: 0,
+            columns: Vec::new(),
+            high: 0,
+            serving: Vec::new(),
+            text: Vec::new(),
+            names: Vec::new(),
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -110,6 +133,7 @@ impl OwnedPayload for ImageRequest {
             .map_or(0, MvccKey::heap_bytes)
             .checked_add(self.span.start.as_ref().map_or(0, key))
             .and_then(|n| n.checked_add(self.span.end.as_ref().map_or(0, key)))
+            .and_then(|n| n.checked_add(self.search.as_ref().map_or(0, |search| search.heap_bytes())))
             .ok_or_else(invalid)
     }
     fn attach_fields(&self, _: Arc<ScratchLease>) -> Result<(), ProtocolError> {
@@ -219,6 +243,13 @@ impl ParticipantMachine {
                         ));
                     }
                     lineage::validate_read(&config, request.read_ts)?;
+                    let cut_search = request.search.as_deref();
+                    let plain_cut = cut_search == Some(&ImageRequest::plain_search_cut());
+                    let config = match cut_search {
+                        Some(_) if plain_cut => Config { search: None, ..config },
+                        Some(cut) => search::at_cut(config, cut)?,
+                        None => config,
+                    };
                     #[cfg(feature = "sim")]
                     super::snapshot_probe(&group, request.read_ts);
                     // Heads first, then direct-commit dedup records, which
@@ -344,6 +375,11 @@ impl ParticipantMachine {
                                 return Err(recovery_unknown());
                             }
                             let value = row::Version::decode(version.value())?;
+                            let value = if plain_cut {
+                                row::Version::plain(value.value)
+                            } else {
+                                value
+                            };
                             let vectors =
                                 row::image_cost(view, logical, &value, records)?
                                     .ok_or_else(row::damaged_value)?;

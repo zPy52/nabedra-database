@@ -18,6 +18,7 @@ pub(super) mod restart;
 pub(super) mod placement;
 pub(super) mod pool_drain;
 pub(super) mod scoped_queue;
+pub(super) mod search;
 pub(super) mod system_recovery;
 mod system_trust;
 pub(super) mod worker_drain;
@@ -88,6 +89,7 @@ impl ControlMachine {
                 | ControlCommand::Enroll { .. }
                 | ControlCommand::CompleteRestart { .. }
                 | ControlCommand::PublishFence { .. }
+                | ControlCommand::Search { .. }
         );
         let mount = match payload {
             ControlCommand::SystemRecovery { command, .. } => match command.as_ref() {
@@ -378,6 +380,7 @@ fn apply_initialized(
             group_damage::begin(tx, scope, state, position, authorization, plan),
         GroupDamageReplaced { authorization, proof, .. } =>
             group_damage::replaced(tx, scope, state, authorization, proof),
+        Search { unix_ms, command, .. } => search::apply(tx, scope, state, *unix_ms, command),
         ReplicaRetired {
             authorization,
             proof,

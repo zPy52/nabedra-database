@@ -40,6 +40,16 @@ async fn fill(s: &mut S) {
     assert!(matches!(s.embed(s.set_vector(6, 26, 26, 30)).await, SearchReply::Set { .. }));
 }
 fn request(s: &S, cut: u64, max_bytes: usize, after: Option<MvccKey>) -> OwnedCommand<ImageRequest> {
+    request_at(s, cut, max_bytes, after, None)
+}
+/// A backup's request, which names the search columns of its cut.
+fn request_at(
+    s: &S,
+    cut: u64,
+    max_bytes: usize,
+    after: Option<MvccKey>,
+    search: Option<SearchSchema>,
+) -> OwnedCommand<ImageRequest> {
     OwnedCommand::new_owned(
         ImageRequest {
             read_ts: ts(cut),
@@ -49,6 +59,7 @@ fn request(s: &S, cut: u64, max_bytes: usize, after: Option<MvccKey>) -> OwnedCo
             after,
             max_items: 128,
             max_bytes,
+            search: search.map(Box::new),
         },
         s.f.shared(),
         ByteClass::Data,
@@ -369,7 +380,7 @@ async fn vs16_a_backup_carries_rows_and_vectors_and_a_restore_derives_its_record
         let reply = restored.submit(ParticipantCommand::Direct(commit.clone())).await;
         assert_eq!(reply, rejected(Fault::DirectInactive));
         assert_eq!(restored.dump().await, before);
-        let fence = s.fence_command(7, columns());
+        let fence = s.fence_from(0, 7, columns());
         assert!(matches!(search_reply(restored.submit(fence).await), SearchReply::Fenced { .. }));
         for key in 1..7 {
             let mut copied = got(&restored.machine, s.f.key(key), 50).await.unwrap();
@@ -433,7 +444,7 @@ async fn vs16_a_restore_of_a_history_keeps_every_version_and_the_newest_records(
             images.reverse();
         }
         let mut restored = restore(&s, &images, 20, batch).await;
-        let fence = s.fence_command(7, columns());
+        let fence = s.fence_from(0, 7, columns());
         assert!(matches!(search_reply(restored.submit(fence).await), SearchReply::Fenced { .. }));
         for at in [10, 11, 12, 13, 14] {
             for key in [1, 2] {
@@ -580,6 +591,7 @@ async fn vs16_a_restore_refuses_vectors_that_do_not_fit_the_backups_columns() {
         high: MULTI,
         serving: Vec::new(),
         text: Vec::new(),
+        names: Vec::new(),
     };
     restore::check_schema(Some(&schema(columns())), &images).unwrap();
     // Another dimension, another kind, a column the backup does not have, none.
@@ -628,14 +640,14 @@ async fn vs16_the_first_search_fence_matches_the_restored_columns() {
     let write = s.write(1, None, Some(row(1, "a")), vec![s.set(PLAIN, s.dense(1))]);
     s.direct(10, write).await;
     let backed_up = images(&s, 10).await;
-    let schema = SearchSchema { epoch: 1, columns: columns(), high: 8, serving: Vec::new(), text: Vec::new() };
+    let schema = SearchSchema { epoch: 1, columns: columns(), high: 8, serving: Vec::new(), text: Vec::new(), names: Vec::new(), };
     let mut restored = restore_with_schema(&s, &backed_up, 10, 1, Some(schema)).await;
 
     let mut wrong = columns();
     wrong[0].dim += 1;
-    let rejected = restored.submit(s.fence_command(7, wrong)).await;
+    let rejected = restored.submit(s.fence_from(0, 7, wrong)).await;
     assert_eq!(search_reply(rejected), SearchReply::Rejected(Fault::InvalidBinding));
-    let ready = restored.submit(s.fence_command(7, columns())).await;
+    let ready = restored.submit(s.fence_from(0, 7, columns())).await;
     assert!(matches!(search_reply(ready), SearchReply::Fenced { epoch: 7, .. }));
     assert!(got(&restored.machine, s.f.key(1), 10).await.is_ok());
 
@@ -653,6 +665,7 @@ fn vs16_a_restore_refuses_malformed_search_metadata_before_reading_rows() {
         high: MULTI,
         serving: Vec::new(),
         text: Vec::new(),
+        names: Vec::new(),
     };
     assert!(restore::check_schema(Some(&checked), &[]).is_ok());
     let mut no_dimension = checked.clone();
@@ -704,9 +717,113 @@ async fn vs16_a_restore_refuses_an_undeclared_embedding_source() {
                 && !search.blobs.0.contains_key(&EMBEDDED)
         })
     }).unwrap();
-    let mut schema = SearchSchema { epoch: 1, columns: columns(), high: MULTI, serving: Vec::new(), text: Vec::new() };
+    let mut schema = SearchSchema { epoch: 1, columns: columns(), high: MULTI, serving: Vec::new(), text: Vec::new(), names: Vec::new(), };
     assert!(restore::check_schema(Some(&schema), &[image]).is_ok());
     schema.columns.retain(|column| column.id != EMBEDDED);
     let error = restore::check_schema(Some(&schema), &[image]).unwrap_err();
     assert_eq!(error.code, ErrorCode::ValidationError);
+}
+
+/// The images and search columns of a backup page at `cut`, read with the
+/// columns `search` of the cut (a backup) or without (a split copy).
+async fn page_at(s: &S, cut: u64, search: Option<SearchSchema>) -> (Vec<CommittedImage>, Option<SearchSchema>) {
+    let page = s.f.machine().committed_image_page(request_at(s, cut, 1 << 20, None, search)).await.unwrap();
+    let ImagePage::Images { images, search, exhausted, .. } = page.payload().unwrap() else { panic!() };
+    assert!(*exhausted);
+    (images.iter().cloned().collect(), search.as_ref().map(|search| search.schema.clone()))
+}
+fn vector_columns(images: &[CommittedImage], key: MvccKey) -> Vec<ColumnId> {
+    let image = images.iter().find(|image| image.key == key).unwrap();
+    image.search.iter().flat_map(|search| search.vectors.iter().map(|vector| vector.column)).collect()
+}
+
+/// VEC-G10, rv-oltp F1 (was `VEC-BUG-backup-cut-current-search-schema`): a
+/// backup at a cut takes the newest version at or below the cut with its
+/// vector. An online `drop_column` fences the range after the cut and before
+/// the backup reads its pages; the backup's request names the columns of
+/// its cut, so the row keeps its vector and the page keeps the column. A
+/// read without them (a split copy) follows the current columns: red for a
+/// mutant that ignores the request's columns.
+#[tokio::test]
+async fn vs40_a_backup_below_a_later_drop_column_keeps_the_rows_vector() {
+    let mut s = S::new().await;
+    let write = s.write(1, None, Some(row(1, "a")), vec![s.set(PLAIN, s.dense(1))]);
+    s.direct(10, write).await;
+    let (_, at_cut) = page_at(&s, 10, None).await;
+    let at_cut = at_cut.unwrap();
+    assert!(at_cut.columns.iter().any(|column| column.id == PLAIN));
+    // Dropped after the cut.
+    let mut kept = columns();
+    kept.retain(|column| column.id != PLAIN);
+    assert!(matches!(s.fence(kept).await, SearchReply::Fenced { .. }));
+    let (images, schema) = page_at(&s, 10, Some(at_cut.clone())).await;
+    assert_eq!(vector_columns(&images, s.f.key(1)), [PLAIN], "the row held a PLAIN vector at the cut");
+    assert_eq!(schema.as_ref(), Some(&at_cut), "the page's columns are those of the cut");
+    let (current, _) = page_at(&s, 10, None).await;
+    assert!(vector_columns(&current, s.f.key(1)).is_empty(), "a split copy follows the range's columns");
+}
+
+/// The same for an online `add_column` after the cut: the page carries the
+/// cut's columns, so the restored range's first fence, with the columns of
+/// the Catalog at the cut, is taken.
+#[tokio::test]
+async fn vs41_a_restore_at_a_cut_before_a_later_add_column_becomes_ready() {
+    let mut s = S::new().await;
+    let write = s.write(1, None, Some(row(1, "a")), vec![s.set(PLAIN, s.dense(1))]);
+    s.direct(10, write).await;
+    let (_, at_cut) = page_at(&s, 10, None).await;
+    let mut wider = columns();
+    wider.push(column(MULTI + 1, VectorKind::Dense, 2));
+    assert!(matches!(s.fence(wider).await, SearchReply::Fenced { .. }));
+    let (backup, schema) = page_at(&s, 10, at_cut).await;
+    let mut restored = restore_with_schema(&s, &backup, 10, 128, schema).await;
+    let first = restored.submit(s.fence_from(0, 7, columns())).await;
+    assert!(
+        matches!(search_reply(first), SearchReply::Fenced { epoch: 7, .. }),
+        "the columns of the cut are taken"
+    );
+}
+
+/// rv-oltp F1: the cut's columns must be this range's history: each one the
+/// range holds with the same definition, or one it dropped since. A column
+/// the range never had, or another definition of a held id, is refused and
+/// the backup fails rather than record other columns.
+#[tokio::test]
+async fn vs40_a_backup_refuses_cut_columns_that_are_not_the_ranges() {
+    let s = S::new().await;
+    let (_, at_cut) = page_at(&s, 10, None).await;
+    let at_cut = at_cut.unwrap();
+    let mut unknown = at_cut.clone();
+    unknown.columns.push(column(at_cut.high + 1, VectorKind::Dense, 2));
+    unknown.high += 1;
+    let mut other = at_cut.clone();
+    other.columns[0].dim += 1;
+    for (name, cut) in [("a column the range never had", unknown), ("another definition", other)] {
+        let error = s.f.machine().committed_image_page(request_at(&s, 10, 1 << 20, None, Some(cut))).await.err().unwrap();
+        assert_eq!(error.code, ErrorCode::StorageUnavailable, "{name}");
+    }
+}
+
+/// A backup with an explicitly plain cut omits columns fenced after it.
+#[tokio::test]
+async fn rvj_a_backup_of_a_table_plain_at_its_cut_omits_the_later_first_column() {
+    let mut s = S::plain(Some(&FaultFs::new())).await;
+    let write = s.write(1, None, Some(row(1, "a")), Vec::new());
+    assert_eq!(s.direct(10, write).await, applied(10));
+    assert_eq!(page_at(&s, 10, None).await.1, None);
+    assert!(matches!(s.fence(vec![column(1, VectorKind::Dense, 2)]).await, SearchReply::Fenced { .. }));
+
+    // Epoch zero represents an explicitly plain Catalog cut.
+    let cut = SearchSchema {
+        epoch: 0, high: 0, columns: Vec::new(), serving: Vec::new(), text: Vec::new(), names: Vec::new(),
+    };
+    let (backup, schema) = page_at(&s, 10, Some(cut)).await;
+    assert_eq!(schema, None);
+    let mut restored = restore_with_schema(&s, &backup, 10, 128, schema).await;
+    let plain_ddl = ParticipantCommand::DirectSchema(DirectSchemaFence {
+        authority: s.f.authority,
+        table_id: s.f.table,
+        change: DirectSchemaChange::Fence { lifecycle: Some(nabedra_rt::ids::uuid_v4()) },
+    });
+    assert!(matches!(restored.submit(plain_ddl).await, ParticipantReply::DirectSchema(_)));
 }

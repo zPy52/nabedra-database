@@ -87,6 +87,8 @@ pub(crate) struct WorkerRuntime {
     retirement_cursor: Mutex<Option<u64>>,
     recovery_probe: Mutex<recovery::RecoveryProbe>,
     gates: Mutex<BTreeMap<Uuid, Weak<AsyncMutex<()>>>>,
+    /// Per search repair owner, the first repair attempt not known finished (rv-j3 N1).
+    search_repairs: Mutex<BTreeMap<Uuid, u64>>,
     changed: Notify,
     admission_cleanup: admission_cleanup::AdmissionCleanup,
     accepting: AtomicBool,
@@ -232,6 +234,7 @@ impl WorkerRuntime {
             retirement_cursor: Mutex::new(None),
             recovery_probe: Mutex::new(recovery::RecoveryProbe::default()),
             gates: Mutex::new(BTreeMap::new()),
+            search_repairs: Mutex::new(BTreeMap::new()),
             changed: Notify::new(),
             admission_cleanup,
             accepting: AtomicBool::new(true),
@@ -1117,6 +1120,9 @@ impl WorkerRuntime {
             let mut request_binding = None;
             let accepted = async {
                 let (operation, owner) = self.decode_raw(reserved.body.clone()).await?;
+                if let Some(table_id) = index_backend::search_ddl_table(&operation.operation) {
+                    self.repair_search_ddl(table_id, expected).await?;
+                }
                 let storage_pin = self.admission.begin_snapshot(&reserved).await?;
                 pin = Some(storage_pin);
                 #[cfg(test)]

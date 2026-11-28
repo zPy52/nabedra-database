@@ -19,7 +19,7 @@ pub(super) const VECTOR: u8 = b'x';
 pub(super) const STAGED: u8 = b'y';
 const DAMAGED_VALUE: &str = "storage corrupt: a stored vector value is missing or damaged";
 const BELOW_FLOOR: &str = "storage corrupt: a transaction resolved at or below the closed floor";
-const COLUMNS_UNKNOWN: &str = "the search columns of this restored range are not known yet";
+pub(super) const COLUMNS_UNKNOWN: &str = "the search columns of this restored range are not known yet";
 
 /// A timestamp per search column.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

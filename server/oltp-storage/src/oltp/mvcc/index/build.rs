@@ -58,6 +58,9 @@ enum BackfillPublication {
 /// they are not represented as an invented public ORM operation.
 pub trait IndexBackend: Send + Sync {
     fn planner(&self) -> &NativePlanner;
+    fn repair_search_ddl(&self, _table_id: Uuid) -> ResolveFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
     fn begin(
         &self,
         job: Uuid,
@@ -142,6 +145,7 @@ impl IndexService {
             attempt,
         };
         let (job, digest) = declaration_job(maintenance, &definition)?;
+        self.backend.repair_search_ddl(definition.table_id).await?;
         let metadata = self
             .backend
             .begin(job, digest, maintenance, fixed_identity)
@@ -179,17 +183,15 @@ impl IndexService {
         // Plan section 7: direct writers stop at the Data log before the
         // source pin, so every direct commit that omitted the new index is
         // below the backfill cut.
-        if let Err(cause) = self
-            .backend
-            .planner()
-            .fence_direct_writers(&metadata.pin, definition.table_id, Some(metadata.txn.request_id))
-            .await
+        let table_record = match self.backend.planner()
+            .fence_index_source(&metadata.pin, definition.table_id, metadata.txn.request_id).await
         {
-            return self.failed(metadata, PlanError::Guarded {
+            Ok(record) => record,
+            Err(cause) => return self.failed(metadata, PlanError::Guarded {
                 cause: Box::new(cause),
                 guards: vec![guard],
-            }).await;
-        }
+            }).await,
+        };
         let (pin, source) = match self
             .backend
             .source_pin(metadata.pin.authority, maintenance)
@@ -217,6 +219,7 @@ impl IndexService {
                     pin,
                     source: source.clone(),
                 },
+                table_record,
                 guard,
                 metadata.owner.clone(),
             )
@@ -291,6 +294,7 @@ impl IndexService {
             attempt: next_attempt,
             ..old
         };
+        self.backend.repair_search_ddl(next.table_id).await?;
         let metadata = self
             .backend
             .begin(
@@ -323,17 +327,15 @@ impl IndexService {
             nabedra_rt::time::sleep(std::time::Duration::from_millis(2)).await;
         };
         // Plan section 7, as in `declare`: fence before the new source pin.
-        if let Err(cause) = self
-            .backend
-            .planner()
-            .fence_direct_writers(&metadata.pin, next.table_id, Some(metadata.txn.request_id))
-            .await
+        let table_record = match self.backend.planner()
+            .fence_index_source(&metadata.pin, next.table_id, metadata.txn.request_id).await
         {
-            return self.failed(metadata, PlanError::Guarded {
+            Ok(record) => record,
+            Err(cause) => return self.failed(metadata, PlanError::Guarded {
                 cause: Box::new(cause),
                 guards: vec![guard],
-            }).await;
-        }
+            }).await,
+        };
         let (pin, source) = match self.backend.source_pin(metadata.pin.authority, next).await {
             Ok(source) => source,
             Err(error) => {
@@ -358,6 +360,7 @@ impl IndexService {
                     pin,
                     source: source.clone(),
                 },
+                table_record,
                 guard,
                 metadata.owner.clone(),
             )
@@ -395,6 +398,7 @@ impl IndexService {
             build_id,
             attempt,
         };
+        self.backend.repair_search_ddl(maintenance.table_id).await?;
         let metadata = self
             .backend
             .begin(
@@ -664,6 +668,9 @@ impl IndexService {
         let mut retries = 0;
         let mut backoff = Duration::from_millis(50);
         loop {
+            if matches!(&publication, BackfillPublication::Ready) {
+                self.backend.repair_search_ddl(maintenance.table_id).await?;
+            }
             let metadata = self.backend.begin(job, digest, maintenance, None).await?;
             let authority = metadata.pin.authority;
             let planner = self.backend.planner();

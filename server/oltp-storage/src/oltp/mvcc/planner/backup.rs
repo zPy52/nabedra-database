@@ -118,12 +118,12 @@ impl NativePlanner {
                                                 .iter()
                                                 .filter_map(|record| record.value.clone())
                                             {
-                                                let decoded: OwnedRecord<Row> =
+                                                let decoded: OwnedRecord<StoredRow> =
                                                     decode_canonical(self.catalog.resources(), raw)
                                                         .await?;
                                                 writer = self
                                                     .cpu(owner.clone(), move || {
-                                                        writer.row((*decoded).clone())?;
+                                                        writer.row(decoded.0.clone())?;
                                                         Ok(writer)
                                                     })
                                                     .await?;

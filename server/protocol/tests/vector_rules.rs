@@ -1223,6 +1223,11 @@ fn rule_the_gate_decides_create_and_the_unserved_operations() {
         let operation = parse(op, &payload).unwrap().operation;
         for vector in [false, true] {
             for check in [Operation::check_served, Operation::check_queued] {
+                // J serves the column operations and `table.search_status`.
+                if op.starts_with("table.") {
+                    assert!(check(&operation, vector).is_ok(), "{op}");
+                    continue;
+                }
                 let error = check(&operation, vector).expect_err(op);
                 assert_eq!(
                     (error.code, error.outcome),

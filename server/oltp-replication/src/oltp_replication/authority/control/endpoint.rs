@@ -186,6 +186,8 @@ enum ReadRequest {
         group_id: Uuid,
         node_id: u64,
     },
+    /// Search reads, commands and ready reports (contract-w2 2.6).
+    Search(super::search::SearchRequest),
 }
 
 impl ReadRequest {
@@ -454,6 +456,9 @@ impl ControlEndpoint {
                 database: session.group().database.clone(),
             };
             let bytes = match request {
+                ReadRequest::Search(request) => {
+                    self.handle.search_rpc(&session, request, leader).await?
+                }
                 ReadRequest::Group { group_id } => {
                     let group = self.handle.group(group_id).await?;
                     self.shared
@@ -2229,6 +2234,12 @@ impl ControlClient {
         after: Option<Uuid>,
     ) -> Result<ReceivedReply, ProtocolError> {
         self.read(&ReadRequest::Apis { revision, after }).await
+    }
+    pub(crate) async fn search(
+        &self,
+        request: super::search::SearchRequest,
+    ) -> Result<ReceivedReply, ProtocolError> {
+        self.read(&ReadRequest::Search(request)).await
     }
     #[doc(hidden)]
     pub async fn replica_routes(

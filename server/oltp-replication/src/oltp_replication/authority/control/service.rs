@@ -27,6 +27,7 @@ mod pool_drain;
 mod replacement;
 mod restart;
 mod scoped_queue;
+mod search;
 mod system_recovery;
 mod worker_drain;
 

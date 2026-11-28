@@ -973,6 +973,7 @@ impl SplitBinding {
             after,
             max_items: 128,
             max_bytes,
+            search: None,
         }
     }
 

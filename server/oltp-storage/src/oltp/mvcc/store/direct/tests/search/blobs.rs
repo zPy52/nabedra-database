@@ -368,6 +368,7 @@ impl ImageRequestOf<'_> {
                 after: None,
                 max_items: 128,
                 max_bytes: 1 << 20,
+                search: None,
             },
             self.0.f.shared(),
             ByteClass::Data,

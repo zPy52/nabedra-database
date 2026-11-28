@@ -415,6 +415,7 @@ async fn o16_o28_source_image_pages_charge_exact_native_and_wire_owners() {
                         after: after.clone(),
                         max_items: 128,
                         max_bytes: 64 << 10,
+                        search: None,
                     },
                     &f.shared,
                     ByteClass::Data,

@@ -4,7 +4,7 @@ use super::{
     CanonicalJson, Change, MvccKey, PreparedWrite,
     catalog::{
         CatalogHandle, CatalogRead, IntentRef, NameRecord, OwnedRecord, PinnedCatalog, PointCatalog, RouteRead,
-        RoutingPage, RoutingRoot, ShardRoute, TableRecord, decode_record,
+        RoutingPage, RoutingRoot, ShardRoute, StoredRow, TableRecord, decode_record,
     },
     store::{
         ParticipantHandle,
@@ -38,6 +38,7 @@ pub use point_route::PointRoute;
 mod query;
 use query::schedule::QueryScheduler;
 mod query_metrics;
+pub mod search_ddl;
 #[doc(hidden)]
 pub mod split;
 pub type ResolveFuture<'a, T> =
@@ -134,6 +135,7 @@ pub struct NativePlanner {
     query_metrics: Arc<query_metrics::QueryMetrics>,
     query_scheduler: QueryScheduler,
     direct: direct_fence::DirectProbeSlot,
+    search: search_ddl::SearchSlot,
 }
 /// Retain only one charged route page and its selected participant during a
 /// mutation plan. The cache cannot outlive or be reused with another pin.
@@ -162,6 +164,7 @@ impl NativePlanner {
             query_metrics,
             query_scheduler,
             direct: Default::default(),
+            search: Default::default(),
         })
     }
     pub(crate) fn with_scoped_execution(
@@ -179,6 +182,7 @@ impl NativePlanner {
             query_metrics: self.query_metrics.clone(),
             query_scheduler: self.query_scheduler.clone(),
             direct: self.direct.clone(),
+            search: self.search.clone(),
         })
     }
 
@@ -280,6 +284,27 @@ impl NativePlanner {
                 Ok(operation)
             })
             .await?;
+        // Search DDL and status (contract-w2 2.6): Catalog steps fenced first.
+        match &operation {
+            Operation::AddColumn(_)
+            | Operation::DropColumn(_)
+            | Operation::AddFullText(_)
+            | Operation::DropFullText(_) => {
+                return self
+                    .plan_search_ddl(&operation, pin, txn, request, table, version, owner.clone())
+                    .await
+                    .map(PlannedOperation::Mutation);
+            }
+            Operation::SearchStatus(_) => {
+                let status = self.search_status(pin, &table).await?;
+                return Ok(PlannedOperation::Read(
+                    self.catalog
+                        .resources()
+                        .encode(&status, protocol::MAX_BODY_BYTES - 128)?,
+                ));
+            }
+            _ => {}
+        }
         if let Operation::Drop(_) = operation {
             return self
                 .drop_table(pin, txn, request, table, version, owner.clone())
@@ -643,10 +668,25 @@ impl NativePlanner {
         let planned = async {
             let epochs = self.catalog.participant().epochs().await?;
             let route = self.resolver.create_data(&descriptor, pin).await?;
+            // A table created with search columns: its group takes them, all
+            // published, at epoch 1 before the Catalog names the table.
+            let search = match super::catalog::CatalogSearch::of_descriptor(&descriptor)? {
+                Some(mut search) => {
+                    let participant = self.resolver.participant(&route.group).await?;
+                    let mut groups = search_ddl::SearchGroups::probe(vec![participant]).await?;
+                    let (epoch, ()) = search_ddl::fence_search(&mut groups, id, 0, |groups| {
+                        Ok((groups.raise_high(search.clone()).named_template(&descriptor, id)?, ()))
+                    })
+                    .await?;
+                    search.epoch = epoch;
+                    Some(search)
+                }
+                None => None,
+            };
             let page = derived_uuid(b"nabedra/route-page/v1", id, txn.request_id);
             let mut writes = self
                 .catalog
-                .create_writes(descriptor.clone(), route, page, &guard)?;
+                .create_writes(descriptor.clone(), route, page, &guard, search)?;
             writes[0].expected_version = name_version;
             Ok(MutationPlan {
                 participants: vec![ParticipantWrites {
@@ -708,8 +748,20 @@ impl NativePlanner {
                     .await?,
             )?;
             // Plan section 7: stop direct writers in the Data log before the
-            // Catalog publishes the drop. The exclusive guard is held.
-            self.fence_direct_writers(pin, id, None).await?;
+            // Catalog publishes the drop. The exclusive guard is held. A
+            // search table's groups give up their columns (`StartDrop`). A
+            // drop discards every column, so it needs no L24 roll-forward:
+            // it fences above every group, including one an interrupted
+            // first `add_column` left ahead of a plain Catalog record.
+            let mut groups = self.search_groups(pin, id).await?;
+            if table.search.is_some() || groups.any_search() {
+                let catalog_epoch = table.search.as_ref().map_or(0, |search| search.epoch);
+                let template = super::catalog::CatalogSearch::empty().template(None);
+                search_ddl::fence_search(&mut groups, id, catalog_epoch, |_| Ok((template.clone(), ())))
+                    .await?;
+            } else {
+                self.fence_direct_writers(pin, id, None).await?;
+            }
             let writes = vec![
                 PreparedWrite {
                     key: MvccKey::CatalogName { name },
@@ -905,7 +957,7 @@ impl NativePlanner {
     ) -> Result<
         (
             Option<nabedra_oltp_types::types::CommitTs>,
-            Option<OwnedRecord<Row>>,
+            Option<OwnedRecord<StoredRow>>,
         ),
         PlanError,
     > {
@@ -1041,7 +1093,7 @@ impl NativePlanner {
         participant: Arc<ParticipantHandle>,
         candidate: &CandidateRow,
         expected: Option<nabedra_oltp_types::types::CommitTs>,
-        old: Option<OwnedRecord<Row>>,
+        old: Option<OwnedRecord<StoredRow>>,
         grouped: &mut MutationGroups,
         owner: &mut Arc<crate::oltp::pool::ScratchLease>,
         used: &mut usize,
@@ -1149,6 +1201,11 @@ fn table_id(op: &Operation) -> Option<Uuid> {
         Operation::Get(p) | Operation::Delete(p) => Some(p.table_id),
         Operation::Update(p) => Some(p.table_id),
         Operation::Collect(p) | Operation::Count(p) | Operation::Explain(p) => Some(p.table_id),
+        Operation::AddColumn(p) => Some(p.table_id),
+        Operation::DropColumn(p) => Some(p.table_id),
+        Operation::AddFullText(p) => Some(p.table_id),
+        Operation::DropFullText(p) => Some(p.table_id),
+        Operation::SearchStatus(p) => Some(p.table_id),
         _ => None,
     }
 }

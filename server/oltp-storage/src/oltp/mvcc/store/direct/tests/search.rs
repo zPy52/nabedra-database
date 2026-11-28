@@ -20,6 +20,7 @@ mod copies;
 mod crash;
 mod embed;
 mod feed;
+mod fence;
 
 /// A dense vector, an embedded dense vector, a sparse and a multi-vector column.
 const PLAIN: ColumnId = 1;
@@ -195,19 +196,26 @@ impl S {
         self.clock += 1;
         self.clock
     }
+    /// A fence of `epoch` that expects the epoch below it (L19's compare).
     fn fence_command(&self, epoch: u64, columns: Vec<SearchColumn>) -> ParticipantCommand {
+        self.fence_from(epoch.saturating_sub(1), epoch, columns)
+    }
+    /// A fence of `epoch` that applies only to a group at `expected`.
+    fn fence_from(&self, expected: u64, epoch: u64, columns: Vec<SearchColumn>) -> ParticipantCommand {
         ParticipantCommand::SearchFence(SearchFence {
             authority: self.f.authority,
             table_id: self.f.table,
             epoch,
+            expected_epoch: Some(expected),
             lifecycle: Some(self.f.table),
             columns,
             serving: Vec::new(),
             text: Vec::new(),
+            names: Vec::new(),
         })
     }
     async fn fence(&mut self, columns: Vec<SearchColumn>) -> SearchReply {
-        let command = self.fence_command(self.search_epoch + 1, columns);
+        let command = self.fence_from(self.search_epoch, self.search_epoch + 1, columns);
         let reply = search_reply(self.f.submit(command).await);
         if let SearchReply::Fenced { epoch, direct } = &reply {
             self.f.search = true;

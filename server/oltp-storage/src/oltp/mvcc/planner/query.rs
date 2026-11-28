@@ -67,7 +67,7 @@ struct OrderingContext {
     _owner: Arc<ScratchLease>,
 }
 enum RowView {
-    Base(OwnedRecord<Row>),
+    Base(OwnedRecord<StoredRow>),
     Cover(OwnedRecord<super::index::IndexPayload>),
 }
 impl std::ops::Deref for RowView {

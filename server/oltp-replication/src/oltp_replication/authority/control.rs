@@ -13,6 +13,7 @@ mod placement;
 mod pool_drain;
 mod restart;
 mod scoped_queue;
+pub(crate) mod search;
 mod service;
 mod system_recovery;
 mod worker_drain;

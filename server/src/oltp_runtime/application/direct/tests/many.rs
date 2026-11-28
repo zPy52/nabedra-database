@@ -648,9 +648,14 @@ async fn vs20_vector_tables_and_unserved_operations_are_refused_explicitly() {
         ),
     ] {
         let body = cluster.body(id, operation, payload.clone());
-        let error = gateway.route(&body, false).await.err().unwrap();
-        assert_eq!(error.code, ErrorCode::UnsupportedOperation, "{operation}");
-        assert_eq!(error.outcome, Outcome::NotApplied);
+        // J's column operations and status are Catalog steps: queued.
+        if operation.starts_with("table.") {
+            assert!(matches!(gateway.route(&body, false).await, Ok(Routed::Queued)), "{operation}");
+        } else {
+            let error = gateway.route(&body, false).await.err().unwrap();
+            assert_eq!(error.code, ErrorCode::UnsupportedOperation, "{operation}");
+            assert_eq!(error.outcome, Outcome::NotApplied);
+        }
         let mut bad = payload;
         bad["x"] = json!(1);
         let error = gateway

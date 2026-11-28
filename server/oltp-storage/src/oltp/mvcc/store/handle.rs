@@ -38,6 +38,7 @@ pub type ScheduledReadFuture<'a> = std::pin::Pin<
     >,
 >;
 mod direct;
+mod search_fence;
 mod timestamp_point;
 pub use direct::LatestRead;
 pub use timestamp_point::PointEvidenceRead;

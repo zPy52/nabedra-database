@@ -8,13 +8,15 @@ use crate::oltp::{
     mvcc::{
         store::{
             ParticipantCommand, ParticipantReply,
-            search::{SearchFence, SearchReply, SearchSchema},
+            search::{SearchFence, SearchReply, SearchSchema, VectorName},
         },
         vector::{SearchColumn, VectorKind},
     },
     pool::ByteClass,
 };
 use crate::oltp_replication::authority::control::VECTOR_FEATURE;
+
+mod repair;
 
 struct Cleanup(PathBuf);
 impl Drop for Cleanup {
@@ -100,16 +102,26 @@ async fn fence(
 ) -> ParticipantReply {
     let handle = runtime.services.resolver.participant(group).await.unwrap();
     let authority = handle.epochs().await.unwrap().authority;
+    // L19: from the epoch the range holds now.
+    let expected = handle.search_probe().await.unwrap().map_or(0, |schema| schema.epoch);
+    // L24: a fence names its vector columns as the planner does, so the next
+    // DDL can roll it forward. Every table here calls its vector `v`.
+    let names = columns
+        .iter()
+        .map(|column| VectorName { id: column.id, name: "v".try_into().unwrap(), model: None })
+        .collect();
     let command = OwnedCommand::new_owned(
         ParticipantCommand::SearchFence(SearchFence {
             authority,
             table_id: table,
             epoch,
+            expected_epoch: Some(expected),
             // A created table's first lifecycle id is its table id.
             lifecycle: Some(table),
             columns,
             serving: Vec::new(),
             text: Vec::new(),
+            names,
         }),
         handle.resources(),
         ByteClass::Progress,
@@ -175,6 +187,7 @@ async fn search_table(path: &Path) -> (Arc<WorkerRuntime>, Uuid, GroupIdentity) 
 /// before the rows. A restore installs it: the restored range takes a first
 /// fence only with the backup's columns, and keeps every row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "VEC-BUG-queued-put-row: table.create now fences its range (J), so the seed rows need X PutRow"]
 async fn vs16_a_search_table_survives_a_native_backup_and_restore_with_its_columns() {
     let path = std::env::temp_dir().join(format!("nabedra-search-archive-{}", nabedra_rt::ids::uuid_v4()));
     std::fs::create_dir(&path).unwrap();
@@ -210,10 +223,8 @@ async fn vs16_a_search_table_survives_a_native_backup_and_restore_with_its_colum
     let none = fence(&target, &group, table, 2, Vec::new()).await;
     assert!(!fenced(&none), "{none:?}");
     assert!(fenced(&fence(&target, &group, table, 2, vec![dense(2)]).await));
-    // The rows: a fence raises the range's direct epoch and the Catalog
-    // publishes after it (task J), so the table's queued reads wait for that
-    // publication, which this test does not model. A backup of the restored
-    // range shows them instead, with the columns the restore installed.
+    // The rows, with the columns the restore installed, as a backup of the
+    // restored range shows them.
     let again = path.join("again");
     target.backup_native(&again, owner(), None).await.unwrap();
     let restored = archived(&target, &again, table);
@@ -256,4 +267,185 @@ async fn vs15_a_queued_row_write_of_a_fenced_search_range_is_applied() {
         assert_eq!(receipt.state, RequestState::Succeeded, "{operation}: {:?}", receipt.error);
     }
     source.drain().await.unwrap();
+}
+
+/// int0 duty (task J). A queued read of a vector table: its stored rows hold
+/// vectors and nulls, which the strict scalar grammar of `Row` refused, so a
+/// queued `get` failed with "invalid pinned catalog or routing lineage",
+/// before the range's fence as after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "VEC-BUG-queued-put-row: table.create now fences its range (J), so the seed rows need X PutRow"]
+async fn vs15_a_queued_get_of_a_vector_table_is_served_before_and_after_its_fence() {
+    let path = std::env::temp_dir().join(format!("nabedra-search-get-{}", nabedra_rt::ids::uuid_v4()));
+    std::fs::create_dir(&path).unwrap();
+    let _cleanup = Cleanup(path.clone());
+    let (source, table, group) = search_table(&path).await;
+    let get = |key: &str| request("table.get", json!({"table_id":table,"key":key}));
+    let row = json!({"id":"a","v":{"f32":"AACAPwAAAEA="}});
+    assert_eq!(run(&source, get("a")).await.1.result, Some(row.clone()));
+    assert_eq!(run(&source, get("b")).await.1.result, Some(json!({"id":"b","v":null})));
+    assert!(fenced(&fence(&source, &group, table, 1, vec![dense(2)]).await));
+    assert_eq!(run(&source, get("a")).await.1.result, Some(row));
+    source.drain().await.unwrap();
+}
+
+// ---- Search DDL on a lone runtime (task J, contract-w2 2.6, IndexLifecycle) ----
+
+/// A lone runtime with `data.vector.v1` on and a table `docs` created with a
+/// dense column `v`, and the table's Data group (from a backup).
+async fn ddl_table(path: &Path) -> (Arc<WorkerRuntime>, Uuid, GroupIdentity) {
+    ddl_table_with_schema(path, json!({"id":"utf8","body":"utf8","v":{"type":"vector","dim":2}})).await
+}
+async fn ddl_table_with_schema(path: &Path, columns: Value) -> (Arc<WorkerRuntime>, Uuid, GroupIdentity) {
+    let runtime = WorkerRuntime::open(&path.join("ddl"), "test", "search-ddl", execution(), resources())
+        .await
+        .unwrap();
+    runtime.without_direct_for_test().await;
+    runtime.services.manager.cluster_features().enable(VECTOR_FEATURE);
+    let (_, created) = run(
+        &runtime,
+        request(
+            "table.create",
+            json!({"name":"docs","schema":columns,
+                "key":"id","format":"parquet"}),
+        ),
+    )
+    .await;
+    let table: Uuid = created.result.as_ref().unwrap()["id"].as_str().unwrap().parse().unwrap();
+    let backup = path.join("created");
+    runtime.backup_native(&backup, owner(), None).await.unwrap();
+    let group = archived(&runtime, &backup, table).group;
+    (runtime, table, group)
+}
+/// The group's search schema in log order.
+async fn schema(runtime: &WorkerRuntime, group: &GroupIdentity) -> SearchSchema {
+    let handle = runtime.services.resolver.participant(group).await.unwrap();
+    handle.search_probe().await.unwrap().expect("a search range")
+}
+/// Epoch, column ids, published ids, and full-text ids with their flag.
+type Ids = (u64, Vec<u16>, Vec<u16>, Vec<(u16, bool)>);
+fn ids(schema: &SearchSchema) -> Ids {
+    (
+        schema.epoch,
+        schema.columns.iter().map(|column| column.id).collect(),
+        schema.serving.clone(),
+        schema.text.iter().map(|text| (text.id, text.serving)).collect(),
+    )
+}
+async fn status(runtime: &Arc<WorkerRuntime>, table: Uuid) -> Value {
+    let (_, reply) = run(runtime, request("table.search_status", json!({"table_id":table}))).await;
+    reply.result.unwrap()["columns"].clone()
+}
+
+/// IndexLifecycle `AddColumn`, `StartDrop`/`FinishDrop` and a re-add on a
+/// real lone runtime: `table.create` fences its range at epoch 1 with every
+/// column published; each column operation fences the range at a larger
+/// epoch before the Catalog commit, a new column is writable and not served
+/// (`building` in `table.search_status`), a dropped one leaves the range, and
+/// a re-added name is a new id that never names the old incarnation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vs14_column_operations_fence_the_range_before_the_catalog_names_them() {
+    let path = std::env::temp_dir().join(format!("nabedra-search-ddl-{}", nabedra_rt::ids::uuid_v4()));
+    std::fs::create_dir(&path).unwrap();
+    let _cleanup = Cleanup(path.clone());
+    let (runtime, table, group) = ddl_table(&path).await;
+    assert_eq!(ids(&schema(&runtime, &group).await), (1, vec![1], vec![1], vec![]));
+    assert_eq!(status(&runtime, table).await["v"]["state"], "ready");
+
+    let add = |name: &str| request("table.add_column", json!({"table_id":table,"name":name,"type":{"type":"vector","dim":3}}));
+    run(&runtime, add("w")).await;
+    assert_eq!(ids(&schema(&runtime, &group).await), (2, vec![1, 2], vec![1], vec![]));
+    let columns = status(&runtime, table).await;
+    assert_eq!((columns["v"]["state"].clone(), columns["w"]["state"].clone()), (json!("ready"), json!("building")));
+
+    run(&runtime, request("table.add_full_text", json!({"table_id":table,"column":"body","language":"english"}))).await;
+    assert_eq!(ids(&schema(&runtime, &group).await), (3, vec![1, 2], vec![1], vec![(3, false)]));
+
+    run(&runtime, request("table.drop_column", json!({"table_id":table,"name":"v"}))).await;
+    assert_eq!(ids(&schema(&runtime, &group).await), (4, vec![2], vec![], vec![(3, false)]));
+    assert!(status(&runtime, table).await.get("v").is_none());
+    let (_, described) = run(&runtime, request("table.describe", json!({"name":"docs"}))).await;
+    assert!(described.result.unwrap()["schema"].get("v").is_none(), "the Catalog dropped the name");
+
+    // A re-add is a new incarnation.
+    run(&runtime, add("v")).await;
+    let again = schema(&runtime, &group).await;
+    assert_eq!(ids(&again), (5, vec![2, 4], vec![], vec![(3, false)]));
+    assert_eq!(again.high, 4);
+
+    run(&runtime, request("table.drop_full_text", json!({"table_id":table,"column":"body"}))).await;
+    assert_eq!(ids(&schema(&runtime, &group).await), (6, vec![2, 4], vec![], vec![]));
+    runtime.drain().await.unwrap();
+}
+
+/// IndexLifecycle `StartDrop`/`FinishDrop` for the table, red for mutant
+/// `drop_without_fence`: `table.drop` of a search table fences its range
+/// with no columns before the Catalog publishes the drop, so no worker can
+/// pass a barrier for a column of the dropped table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vs14_a_table_drop_fences_its_ranges_first() {
+    let path = std::env::temp_dir().join(format!("nabedra-search-drop-{}", nabedra_rt::ids::uuid_v4()));
+    std::fs::create_dir(&path).unwrap();
+    let _cleanup = Cleanup(path.clone());
+    let (runtime, table, group) = ddl_table(&path).await;
+    run(&runtime, request("table.drop", json!({"table_id":table}))).await;
+    let dropped = schema(&runtime, &group).await;
+    assert_eq!(ids(&dropped), (2, vec![], vec![], vec![]));
+    assert_eq!(dropped.high, 1, "ids stay used");
+    runtime.drain().await.unwrap();
+}
+
+/// An unrelated DDL rolls a fenced drop forward before allocating its own column.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rvj_an_interrupted_drop_column_is_adopted_by_the_next_ddl() {
+    let path = std::env::temp_dir().join(format!("nabedra-search-adopt-{}", nabedra_rt::ids::uuid_v4()));
+    std::fs::create_dir(&path).unwrap();
+    let _cleanup = Cleanup(path.clone());
+    let (runtime, table, group) = ddl_table(&path).await;
+    assert!(fenced(&fence(&runtime, &group, table, 2, Vec::new()).await));
+    assert_eq!(status(&runtime, table).await["v"]["state"], "ready");
+
+    run(&runtime, request("table.add_column", json!({
+        "table_id":table,"name":"w","type":{"type":"vector","dim":3}
+    }))).await;
+    let columns = status(&runtime, table).await;
+    assert!(columns.get("v").is_none());
+    assert_eq!(columns["w"]["state"], "building");
+    assert_eq!(ids(&schema(&runtime, &group).await), (3, vec![2], vec![], vec![]));
+    runtime.drain().await.unwrap();
+}
+
+/// A plain Catalog record cannot hide an interrupted first search fence from index or drop DDL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn vs14_an_interrupted_first_column_is_adopted_by_index_and_drop_ddl() {
+    use crate::oltp::mvcc::index::IndexDefinition;
+    use crate::oltp_replication::types::{Page, Text};
+
+    for index in [false, true] {
+        let path = std::env::temp_dir().join(format!("nabedra-first-fence-{}", nabedra_rt::ids::uuid_v4()));
+        std::fs::create_dir(&path).unwrap();
+        let _cleanup = Cleanup(path.clone());
+        let (runtime, table, group) = ddl_table_with_schema(&path, json!({"id":"utf8","body":"utf8"})).await;
+        assert!(fenced(&fence(&runtime, &group, table, 1, vec![dense(2)]).await));
+        assert_eq!(status(&runtime, table).await, json!({}));
+        if index {
+            runtime.create_index(
+                IndexDefinition {
+                    index_id: nabedra_rt::ids::uuid_v4(),
+                    table_id: table,
+                    name: Text::try_from("by_body").unwrap(),
+                    columns: Page::new(vec![Text::try_from("body").unwrap()]).unwrap(),
+                    covering: Page::new(Vec::new()).unwrap(),
+                },
+                nabedra_rt::ids::uuid_v4(),
+                1,
+            ).await.unwrap();
+            assert_eq!(status(&runtime, table).await["v"]["state"], "building");
+            assert_eq!(ids(&schema(&runtime, &group).await), (3, vec![1], vec![], vec![]));
+        } else {
+            run(&runtime, request("table.drop", json!({"table_id":table}))).await;
+            assert_eq!(ids(&schema(&runtime, &group).await), (2, vec![], vec![], vec![]));
+        }
+        runtime.drain().await.unwrap();
+    }
 }

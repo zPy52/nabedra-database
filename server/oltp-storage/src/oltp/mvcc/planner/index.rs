@@ -42,7 +42,7 @@ pub fn index_entry_changes(
     };
     let old_key = old.map(entry).transpose()?;
     let new_row = new
-        .map(|raw| serde_json::from_str::<Row>(raw.as_str()).map_err(|_| not_found()))
+        .map(|raw| crate::protocol::decode_row(raw.as_str()).map_err(|_| not_found()))
         .transpose()?;
     let new_key = new_row.as_ref().map(entry).transpose()?;
     let put = match (new_key, new_row.as_ref()) {
@@ -70,7 +70,7 @@ impl NativePlanner {
         table: OwnedRecord<TableRecord>,
         participant: Arc<ParticipantHandle>,
         key: &Key,
-        old: Option<OwnedRecord<Row>>,
+        old: Option<OwnedRecord<StoredRow>>,
         new: Option<CanonicalJson>,
         owner: &mut Arc<ScratchLease>,
         used: &mut usize,
@@ -173,7 +173,7 @@ impl NativePlanner {
                             &definition.definition,
                             &schema.descriptor,
                             &primary,
-                            old_row.as_deref(),
+                            old_row.as_deref().map(|row| &row.0),
                             raw_new.as_ref(),
                             &resources,
                         )
@@ -279,6 +279,7 @@ impl NativePlanner {
         request: RequestBinding,
         definition: IndexDefinition,
         phase: IndexPhase,
+        fenced_table: TableRecord,
         guard: VerifiedLifecycleGuard,
         owner: Arc<ScratchLease>,
     ) -> Result<MutationPlan, PlanError> {
@@ -418,7 +419,7 @@ impl NativePlanner {
                 PreparedWrite {
                     key: MvccKey::CatalogTable { table_id },
                     expected_version: table_version,
-                    change: self.index_put(&table.with_lifecycle(txn.request_id))?,
+                    change: self.index_put(&fenced_table)?,
                 },
             ]);
             let epochs = self.catalog.participant().epochs().await?;
