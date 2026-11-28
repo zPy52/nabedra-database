@@ -310,7 +310,9 @@ async fn schema(runtime: &WorkerRuntime, group: &GroupIdentity) -> SearchSchema 
     let handle = runtime.services.resolver.participant(group).await.unwrap();
     handle.search_probe().await.unwrap().expect("a search range")
 }
-fn ids(schema: &SearchSchema) -> (u64, Vec<u16>, Vec<u16>, Vec<(u16, bool)>) {
+/// Epoch, column ids, published ids, and full-text ids with their flag.
+type Ids = (u64, Vec<u16>, Vec<u16>, Vec<(u16, bool)>);
+fn ids(schema: &SearchSchema) -> Ids {
     (
         schema.epoch,
         schema.columns.iter().map(|column| column.id).collect(),

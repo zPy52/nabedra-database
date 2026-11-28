@@ -366,11 +366,11 @@ pub(crate) enum FenceStop {
     /// Another DDL fenced a group at or above this step's epoch, or with an
     /// id this step did not see: start over from a fresh probe.
     Overtaken,
-    Failed(PlanError),
+    Failed(Box<PlanError>),
 }
 impl From<ProtocolError> for FenceStop {
     fn from(error: ProtocolError) -> Self {
-        Self::Failed(error.into())
+        Self::Failed(Box::new(error.into()))
     }
 }
 
@@ -406,9 +406,9 @@ pub(crate) async fn fence_all<G: FenceTarget>(
                     *schema = target.probe().await?;
                 }
                 SearchReply::Rejected(Fault::Conflict) => {
-                    return Err(FenceStop::Failed(
+                    return Err(FenceStop::Failed(Box::new(
                         conflict("a Data group kept refusing the search fence; retry the request").into(),
-                    ));
+                    )));
                 }
                 SearchReply::Rejected(Fault::SplitInProgress) if splits < SPLIT_RETRIES => {
                     splits += 1;
@@ -416,18 +416,18 @@ pub(crate) async fn fence_all<G: FenceTarget>(
                     backoff = (backoff * 2).min(Duration::from_secs(1));
                 }
                 SearchReply::Rejected(Fault::SplitInProgress) => {
-                    return Err(FenceStop::Failed(
+                    return Err(FenceStop::Failed(Box::new(
                         failure(
                             ErrorCode::StorageUnavailable,
                             "a split holds a range of the table; retry the search DDL",
                         )
                         .into(),
-                    ));
+                    )));
                 }
                 _ => {
-                    return Err(FenceStop::Failed(
+                    return Err(FenceStop::Failed(Box::new(
                         invalid("a Data group refused the search fence").into(),
-                    ));
+                    )));
                 }
             }
         }
@@ -444,7 +444,7 @@ pub(crate) async fn fence_search<G: FenceTarget, T>(
     groups: &mut SearchGroups<G>,
     table_id: Uuid,
     catalog_epoch: u64,
-    mut make: impl FnMut(&SearchGroups<G>) -> Result<(SearchFenceTemplate, T), PlanError>,
+    mut make: impl FnMut(&SearchGroups<G>) -> Result<(SearchFenceTemplate, T), ProtocolError>,
 ) -> Result<(u64, T), PlanError> {
     for tries in 1.. {
         let epoch = groups.next_epoch(catalog_epoch)?;
@@ -453,7 +453,7 @@ pub(crate) async fn fence_search<G: FenceTarget, T>(
             Ok(()) => return Ok((epoch, next)),
             Err(FenceStop::Overtaken) if tries < FENCE_TRIES => groups.reprobe().await?,
             Err(FenceStop::Overtaken) => break,
-            Err(FenceStop::Failed(error)) => return Err(error),
+            Err(FenceStop::Failed(error)) => return Err(*error),
         }
     }
     Err(conflict("another search DDL fenced the table; retry the request").into())
@@ -547,7 +547,7 @@ impl NativePlanner {
                     Err(FenceStop::Overtaken) => {
                         return Err(conflict("another search DDL fenced the table; retry the request").into());
                     }
-                    Err(FenceStop::Failed(error)) => return Err(error),
+                    Err(FenceStop::Failed(error)) => return Err(*error),
                 }
             }
         }
@@ -557,6 +557,7 @@ impl NativePlanner {
     /// `table.add_column`, `drop_column`, `add_full_text`, `drop_full_text`:
     /// one Catalog step under the Exclusive guard, fenced first. A new
     /// column is `Building` until `plan_search_publish`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn plan_search_ddl(
         &self,
         operation: &Operation,
@@ -612,7 +613,7 @@ impl NativePlanner {
             let mut groups = self.search_groups(pin, id).await?;
             let next = self
                 .fence_step(&mut groups, id, current.epoch, txn, |groups| {
-                    Ok(step(groups.raise_high(current.clone()))?)
+                    step(groups.raise_high(current.clone()))
                 })
                 .await?;
             self.publish_search(&table, version, descriptor, next, txn, guard.clone(), owner.clone())
@@ -655,7 +656,7 @@ impl NativePlanner {
             }
             let next = self
                 .fence_step(&mut groups, table_id, current.epoch, txn, |groups| {
-                    Ok(groups.raise_high(current.clone()).publish(column)?)
+                    groups.raise_high(current.clone()).publish(column)
                 })
                 .await?;
             self.publish_search(&table, version, table.descriptor.clone(), next, txn, guard.clone(), owner.clone())
@@ -677,7 +678,7 @@ impl NativePlanner {
         table_id: Uuid,
         catalog_epoch: u64,
         txn: TxnId,
-        next: impl Fn(&SearchGroups) -> Result<CatalogSearch, PlanError>,
+        next: impl Fn(&SearchGroups) -> Result<CatalogSearch, ProtocolError>,
     ) -> Result<CatalogSearch, PlanError> {
         let lifecycle = Some(txn.request_id);
         let (epoch, mut next) = fence_search(groups, table_id, catalog_epoch, |groups| {
