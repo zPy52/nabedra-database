@@ -419,8 +419,15 @@ fn memory<T>(control: Uuid, term: u64, f: impl FnOnce(&mut Memory) -> T) -> Resu
         .lock()
         .map_err(|_| invalid("search report memory is poisoned"))?;
     let memory = all.entry(control).or_default();
+    if term < memory.term {
+        return Err(ProtocolError::new(
+            ErrorCode::Conflict,
+            "search report memory is in a newer Control term",
+            Outcome::NotApplied,
+        ));
+    }
     // A new leader term starts empty: `Failover` loses `seen`.
-    if memory.term != term {
+    if term > memory.term {
         *memory = Memory {
             term,
             ..Memory::default()
