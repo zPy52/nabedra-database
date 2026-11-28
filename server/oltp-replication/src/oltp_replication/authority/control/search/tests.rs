@@ -270,24 +270,20 @@ fn rvj_a_move_waits_for_every_page_of_the_same_report() {
     );
 }
 
-/// rv-j proof: a report refused because leader memory is full removes the
-/// worker's earlier report (`record_report` takes it out of the map before
-/// the bound check) and leaves the range count at the bound, so the worker
-/// loses its ready ranges and later reports are refused although memory
-/// holds fewer ranges.
+/// An overloaded page leaves the previous page and the range count intact.
 #[test]
 fn rvj_a_refused_report_keeps_the_workers_earlier_report() {
     let control = nabedra_rt::ids::uuid_v4();
     let (table, other) = (id(1), id(2));
-    let mut one = report(10, table, 1, vec![(1, ColumnState::Ready)]);
-    one.pages = 2;
+    let ready = vec![(1, ColumnState::Ready)];
+    let one = SearchReport { pages: 2, ..report(10, table, 1, ready.clone()) };
     record_report(control, 1, one.clone()).unwrap();
     // Fill leader memory to the bound with other workers' reports.
     let mut left = MAX_MEMORY_RANGES - 1;
     let mut worker = 1_000u128;
     while left > 0 {
         let n = left.min(MAX_REPORT_RANGES);
-        let mut filler = report(worker, other, 1, vec![(1, ColumnState::Ready)]);
+        let mut filler = report(worker, other, 1, ready.clone());
         filler.ranges = (0..n as u128)
             .map(|r| RangeReport { group_id: id(1_000_000 + worker * 16 + r), ..filler.ranges[0].clone() })
             .collect();
@@ -295,10 +291,25 @@ fn rvj_a_refused_report_keeps_the_workers_earlier_report() {
         left -= n;
         worker += 1;
     }
-    // Worker 10 reports a second range: one over the bound, refused.
     let mut more = one.clone();
     more.page = 1;
     more.ranges[0].group_id = id(78);
-    assert!(record_report(control, 1, more).is_err());
-    assert_eq!(reports(control, 1, table).unwrap().len(), 1, "the earlier report of worker 10 is kept");
+    let error = record_report(control, 1, more.clone()).unwrap_err();
+    assert_eq!(error.code, ErrorCode::Overloaded);
+    assert_eq!(reports(control, 1, table).unwrap(), [one.clone()]);
+    let counts = memory(control, 1, |memory| {
+        let actual: usize = memory.reports.values()
+            .flat_map(|report| report.pages.values())
+            .map(|page| page.ranges.len())
+            .sum();
+        (memory.ranges, actual)
+    }).unwrap();
+    assert_eq!(counts, (MAX_MEMORY_RANGES, MAX_MEMORY_RANGES));
+
+    // A new, smaller snapshot frees space and permits retry of the refused page.
+    let smaller = SearchReport { report_id: 2, ..report(1_000, other, 1, ready) };
+    record_report(control, 1, smaller).unwrap();
+    record_report(control, 1, more.clone()).unwrap();
+    assert_eq!(reports(control, 1, table).unwrap(), [one, more]);
+    assert!(reports(control, 2, table).unwrap().is_empty());
 }
