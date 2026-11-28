@@ -458,14 +458,49 @@ pub(crate) fn record_report(control: Uuid, term: u64, report: SearchReport) -> R
                 return Err(invalid("search report pages disagree on page count"));
             }
         }
-        let before = old.map_or(0, |old| old.ranges);
-        let kept = old.filter(|_| same).map_or(0, |old| {
-            old.ranges - old.pages.get(&report.page).map_or(0, |page| page.ranges.len())
-        });
-        let next_ranges = kept + report.ranges.len();
-        let after = memory.ranges - before + next_ranges;
+        // A newer assignment epoch also retires the worker's snapshots of the
+        // table's other shards at older epochs (it no longer holds them as
+        // reported), so `range_status` never counts a stale snapshot.
         let worker = report.worker_id;
-        let worker_after = memory.worker_ranges.get(&worker).copied().unwrap_or(0) - before + next_ranges;
+        let stale: Vec<((Uuid, Uuid, u32), usize)> = memory
+            .reports
+            .range((report.table_id, worker, 0)..=(report.table_id, worker, u32::MAX))
+            .filter(|(other, held)| {
+                **other != key
+                    && held
+                        .pages
+                        .values()
+                        .next()
+                        .is_some_and(|page| page.assignment_epoch < report.assignment_epoch)
+            })
+            .map(|(other, held)| (*other, held.ranges))
+            .collect();
+        let accounting = || invalid("search report accounting is inconsistent");
+        let before = stale
+            .iter()
+            .try_fold(old.map_or(0, |old| old.ranges), |sum, (_, ranges)| sum.checked_add(*ranges))
+            .ok_or_else(accounting)?;
+        let kept = match old.filter(|_| same) {
+            Some(old) => old
+                .ranges
+                .checked_sub(old.pages.get(&report.page).map_or(0, |page| page.ranges.len()))
+                .ok_or_else(accounting)?,
+            None => 0,
+        };
+        let next_ranges = kept.checked_add(report.ranges.len()).ok_or_else(accounting)?;
+        let after = memory
+            .ranges
+            .checked_sub(before)
+            .and_then(|rest| rest.checked_add(next_ranges))
+            .ok_or_else(accounting)?;
+        let worker_after = memory
+            .worker_ranges
+            .get(&worker)
+            .copied()
+            .unwrap_or(0)
+            .checked_sub(before)
+            .and_then(|rest| rest.checked_add(next_ranges))
+            .ok_or_else(accounting)?;
         if worker_after > MAX_WORKER_RANGES {
             return Err(ProtocolError::new(
                 ErrorCode::Overloaded,
@@ -479,6 +514,9 @@ pub(crate) fn record_report(control: Uuid, term: u64, report: SearchReport) -> R
                 "Control holds too many search reports",
                 Outcome::NotApplied,
             ));
+        }
+        for (other, _) in stale {
+            memory.reports.remove(&other);
         }
         let next = memory.reports.entry(key).or_default();
         if !same {
