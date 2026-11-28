@@ -64,13 +64,23 @@ impl WorkerRuntime {
         // skipped; one that stopped before it finished resumes. The gate
         // serializes attempts; the cursor only skips finished ids.
         let mut attempt = self.search_repairs.lock().map_err(|_| unknown())?.get(&owner_id).copied().unwrap_or(1);
-        let mut tries = 0u8;
+        let (mut tries, mut settled) = (0u8, true);
         loop {
             let (id, digest, maintenance) = search_repair_attempt(authority.run_id, scope, table_id, attempt)?;
             let reservation_digest = metadata_digest(id, digest, maintenance)?;
-            if let Some(IdentityLookup::Terminal(_)) = self.services.status.lookup_identity(id, Some(reservation_digest)).await? {
+            if let Some(IdentityLookup::Terminal(terminal)) = self.services.status.lookup_identity(id, Some(reservation_digest)).await? {
+                // rv-j3 N3: finish an attempt that stopped before it released
+                // its guard and pin. A failure leaves the cursor here, so a
+                // later repair tries again; this one goes on.
+                if let Err(error) = self.settle_search_repair(authority, maintenance, terminal).await {
+                    tracing::warn!(table=%table_id, attempt, code=?error.code, message=%error.message,
+                        "a stopped search repair keeps its metadata pin");
+                    settled = false;
+                }
                 attempt = attempt.checked_add(1).ok_or_else(unknown)?;
-                self.search_repairs.lock().map_err(|_| unknown())?.insert(owner_id, attempt);
+                if settled {
+                    self.search_repairs.lock().map_err(|_| unknown())?.insert(owner_id, attempt);
+                }
                 continue;
             }
             if tries == 3 {
@@ -131,6 +141,43 @@ impl WorkerRuntime {
             }
         }
         Err(ProtocolError::new(ErrorCode::Conflict, "search DDL recovery conflicted; retry the request", Outcome::NotApplied))
+    }
+
+    /// A finished repair attempt whose actor stopped before it released its
+    /// Exclusive guard and metadata pin: resolve it, release the guard (as a
+    /// helper does) and then the pin, which otherwise holds the retention floor.
+    async fn settle_search_repair(
+        &self,
+        authority: Authority,
+        owner: MaintenanceOwnerRef,
+        terminal: TerminalIdentity,
+    ) -> Result<(), ProtocolError> {
+        let services = &self.services;
+        let (reservation, request) = repair_reservation(&terminal)?;
+        let txn = TxnId { request_id: reservation.request_id, attempt: 1 };
+        let observation = services.timestamps.index_metadata_pin(authority, owner, txn, reservation, request).await?;
+        if observation.released {
+            return Ok(());
+        }
+        if let Some(holder) = services.catalog.participant().lifecycle_exclusive(owner.table_id).await?
+            && holder.txn == txn
+        {
+            self.help_lifecycle(holder).await?;
+        }
+        let settled = match terminal {
+            TerminalIdentity::Committed { decision, .. } => {
+                self.transactions.recover(authority, txn).await?.ok_or_else(unknown)?;
+                services.status.settled_proof(txn, decision.manifest).await?
+            }
+            _ => services.status.failure_settled_proof(txn, request).await?,
+        };
+        let identity = PinIdentity {
+            run_id: reservation.original_run,
+            request_id: reservation.request_id,
+            digest: reservation.digest,
+            nonce: reservation.reservation_id,
+        };
+        services.timestamps.release_index_metadata(authority, identity, observation.pin, settled).await
     }
 
     pub(super) fn index_service(self: &Arc<Self>, authority: Option<Authority>) -> IndexService {
@@ -797,6 +844,14 @@ impl IndexBackend for RuntimeIndexes {
     }
 }
 
+fn repair_reservation(terminal: &TerminalIdentity) -> Result<(IdentityReservation, RequestBinding), ProtocolError> {
+    match terminal {
+        TerminalIdentity::Committed { reservation, decision, .. } => Ok((*reservation, decision.request)),
+        TerminalIdentity::Failed { reservation, request, .. } => Ok((*reservation, *request)),
+        TerminalIdentity::ReadExpired { .. } => Err(unknown()),
+    }
+}
+
 fn repair_owner(scope: Uuid, table_id: Uuid) -> Result<Uuid, ProtocolError> {
     Ok(repair_uuid(serialized_digest(&(b"search-repair-owner/v1", scope, table_id))?))
 }
@@ -855,6 +910,26 @@ impl WorkerRuntime {
     /// The production index backend, for tests that wrap it.
     pub(super) fn index_backend_for_test(self: &Arc<Self>) -> Arc<dyn IndexBackend> {
         Arc::new(RuntimeIndexes { runtime: self.clone(), authority: None })
+    }
+
+    /// Whether the metadata pin of the table's `attempt`th search repair in
+    /// this run is released; None while the attempt has no Status outcome.
+    pub(super) async fn search_repair_pin_released(
+        &self,
+        table_id: Uuid,
+        attempt: u64,
+    ) -> Result<Option<bool>, ProtocolError> {
+        let authority = self.index_authority(None).await?;
+        let scope = self.services.catalog.participant().identity().group_id;
+        let (id, digest, owner) = search_repair_attempt(authority.run_id, scope, table_id, attempt)?;
+        let lookup = self.services.status.lookup_identity(id, Some(metadata_digest(id, digest, owner)?)).await?;
+        let Some(IdentityLookup::Terminal(terminal)) = lookup else {
+            return Ok(None);
+        };
+        let (reservation, request) = repair_reservation(&terminal)?;
+        let txn = TxnId { request_id: id, attempt: 1 };
+        let pin = self.services.timestamps.index_metadata_pin(authority, owner, txn, reservation, request).await?;
+        Ok(Some(pin.released))
     }
 
     pub(crate) async fn run_index_fault_command(

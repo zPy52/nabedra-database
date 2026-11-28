@@ -160,3 +160,41 @@ async fn rvj3_a_crashed_guard_holder_does_not_block_the_next_column_ddl() {
     assert_eq!(ids(&schema(&runtime, &group).await), (3, vec![1, 2], vec![1], vec![]));
     runtime.drain().await.unwrap();
 }
+
+/// rv-j3 N3: a repair that stopped after its Status decision, before it
+/// resolved and released anything, left its metadata pin active, which holds
+/// the retention floor, and its Exclusive guard held. The next repair of the
+/// table (here at the next column DDL) finishes it and releases both. Before,
+/// no path released the pin, and the guard failed the column DDL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rvj3_the_next_repair_releases_the_pin_of_a_repair_stopped_after_its_decision() {
+    use crate::oltp_runtime::recovery_tests::index_holds::{self, Stage};
+    let path = std::env::temp_dir().join(format!("nabedra-repair-pin-{}", nabedra_rt::ids::uuid_v4()));
+    std::fs::create_dir(&path).unwrap();
+    let _cleanup = Cleanup(path.clone());
+    let (runtime, table, group) = ddl_table(&path).await;
+    // An interrupted drop of `v`: the range is ahead of the Catalog.
+    assert!(fenced(&fence(&runtime, &group, table, 2, Vec::new()).await));
+    let catalog = runtime.services.catalog.participant().identity().group_id;
+    let mut holds = index_holds::register(catalog);
+    let repair = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.repair_search_ddl(table, None).await })
+    };
+    let wait = std::time::Duration::from_secs(30);
+    let prepared = nabedra_rt::time::timeout(wait, holds.recv()).await.unwrap().unwrap();
+    assert_eq!(prepared.stage, Stage::Prepared);
+    prepared.release.send(()).unwrap();
+    let decided = nabedra_rt::time::timeout(wait, holds.recv()).await.unwrap().unwrap();
+    assert_eq!((decided.stage, decided.txn), (Stage::Decided, prepared.txn));
+    repair.abort();
+    assert!(repair.await.unwrap_err().is_cancelled());
+    drop(decided);
+    index_holds::unregister(catalog);
+    assert_eq!(runtime.search_repair_pin_released(table, 1).await.unwrap(), Some(false));
+
+    run(&runtime, add(table, "w")).await;
+    assert_eq!(runtime.search_repair_pin_released(table, 1).await.unwrap(), Some(true));
+    assert_eq!(ids(&schema(&runtime, &group).await), (3, vec![2], vec![], vec![]));
+    runtime.drain().await.unwrap();
+}
