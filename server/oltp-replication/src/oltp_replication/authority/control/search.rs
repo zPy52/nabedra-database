@@ -20,7 +20,7 @@ use crate::oltp::mvcc::vector::ColumnId;
 use crate::protocol::{ErrorCode, Outcome, ProtocolError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use uuid::Uuid;
 
@@ -243,25 +243,35 @@ pub(crate) fn cancel(
     Ok(assignment)
 }
 
-/// SearchAssign `RecvReady`: the new replica of the move reported, for the
-/// move's epoch, every range of its table ready for every column it builds,
-/// and at least one range. Reports of another worker or epoch do not count.
+/// SearchAssign `RecvReady`: every page of the new replica's shard snapshot
+/// at the move's epoch is present, with every reported range ready.
 pub fn move_ready(assignment: &SearchAssignment, reports: &[SearchReport]) -> bool {
     let Some(mv) = assignment.next else {
         return false;
     };
-    reports.iter().any(|report| {
+    let mut snapshot = None;
+    let mut pages = BTreeSet::new();
+    let mut ranges = BTreeSet::new();
+    for report in reports.iter().filter(|report| {
         report.worker_id == mv.add
             && report.table_id == assignment.table_id
             && report.assignment_epoch == mv.epoch
-            && !report.ranges.is_empty()
-            && report.ranges.iter().all(|range| {
-                range
-                    .columns
-                    .iter()
-                    .all(|(_, state)| *state == ColumnState::Ready)
+            && report.shard == mv.shard
+    }) {
+        let id = (report.process, report.report_id, report.pages);
+        if snapshot.get_or_insert(id) != &id
+            || report.page >= report.pages
+            || !pages.insert(report.page)
+            || report.ranges.is_empty()
+            || !report.ranges.iter().all(|range| {
+                ranges.insert(range.group_id)
+                    && range.columns.iter().all(|(_, state)| *state == ColumnState::Ready)
             })
-    })
+        {
+            return false;
+        }
+    }
+    snapshot.is_some_and(|(_, _, total)| usize::from(total) == pages.len())
 }
 
 /// Read the workers needed for placement without loading the whole inventory.
@@ -373,6 +383,9 @@ pub(crate) fn valid_report(report: &SearchReport) -> bool {
     !report.worker_id.is_nil()
         && !report.process.is_nil()
         && !report.table_id.is_nil()
+        && report.shard < MAX_SHARDS as u32
+        && report.page < report.pages
+        && !report.ranges.is_empty()
         && report.ranges.len() <= MAX_REPORT_RANGES
         && report.ranges.iter().all(|range| {
             !range.group_id.is_nil()
@@ -385,8 +398,13 @@ pub(crate) fn valid_report(report: &SearchReport) -> bool {
 #[derive(Default)]
 struct Memory {
     term: u64,
-    /// `(table, worker)` → the worker's last report, its ranges merged.
-    reports: BTreeMap<(Uuid, Uuid), SearchReport>,
+    /// The worker's latest snapshot for each `(table, worker, shard)`.
+    reports: BTreeMap<(Uuid, Uuid, u32), ReportPages>,
+    ranges: usize,
+}
+#[derive(Default)]
+struct ReportPages {
+    pages: BTreeMap<u16, SearchReport>,
     ranges: usize,
 }
 /// Per Control group (tests run several in one process).
@@ -406,29 +424,35 @@ fn memory<T>(control: Uuid, term: u64, f: impl FnOnce(&mut Memory) -> T) -> Resu
     }
     Ok(f(memory))
 }
-/// Records `report` in the memory of the leader of `term`. A report of a new
-/// process replaces the worker's earlier one; otherwise its ranges replace
-/// the same ranges and keep the others.
+/// Records a page in the leader's current term. A newer assignment,
+/// restarted worker, or newer report supersedes the last snapshot.
 pub(crate) fn record_report(control: Uuid, term: u64, report: SearchReport) -> Result<(), ProtocolError> {
     if !valid_report(&report) {
         return Err(invalid("invalid search report"));
     }
     memory(control, term, |memory| {
-        let key = (report.table_id, report.worker_id);
-        let before = memory.reports.get(&key).map_or(0, |old| old.ranges.len());
-        let next = match memory.reports.remove(&key) {
-            Some(mut old) if old.process == report.process && old.assignment_epoch == report.assignment_epoch => {
-                for range in report.ranges {
-                    old.ranges.retain(|kept| kept.group_id != range.group_id);
-                    old.ranges.push(range);
-                }
-                old.queue = report.queue;
-                old.memory_used = report.memory_used;
-                old
+        let key = (report.table_id, report.worker_id, report.shard);
+        let old = memory.reports.get(&key);
+        let mut same = false;
+        if let Some((_, first)) = old.and_then(|old| old.pages.first_key_value()) {
+            let same_epoch = first.assignment_epoch == report.assignment_epoch;
+            let same_process = first.process == report.process;
+            if report.assignment_epoch < first.assignment_epoch
+                || (same_epoch && same_process && report.report_id < first.report_id)
+            {
+                return Ok(());
             }
-            _ => report,
-        };
-        let after = memory.ranges.saturating_sub(before).saturating_add(next.ranges.len());
+            same = same_epoch && same_process && first.report_id == report.report_id;
+            if same && first.pages != report.pages {
+                return Err(invalid("search report pages disagree on page count"));
+            }
+        }
+        let old = memory.reports.remove(&key);
+        let before = old.as_ref().map_or(0, |old| old.ranges);
+        let mut next = old.filter(|_| same).unwrap_or_default();
+        let page_before = next.pages.get(&report.page).map_or(0, |page| page.ranges.len());
+        next.ranges = next.ranges - page_before + report.ranges.len();
+        let after = memory.ranges - before + next.ranges;
         if after > MAX_MEMORY_RANGES {
             return Err(ProtocolError::new(
                 ErrorCode::Overloaded,
@@ -436,6 +460,7 @@ pub(crate) fn record_report(control: Uuid, term: u64, report: SearchReport) -> R
                 Outcome::NotApplied,
             ));
         }
+        next.pages.insert(report.page, report);
         memory.ranges = after;
         memory.reports.insert(key, next);
         Ok(())
@@ -446,8 +471,8 @@ pub(crate) fn reports(control: Uuid, term: u64, table: Uuid) -> Result<Vec<Searc
     memory(control, term, |memory| {
         memory
             .reports
-            .range((table, Uuid::nil())..=(table, Uuid::max()))
-            .map(|(_, report)| report.clone())
+            .range((table, Uuid::nil(), 0)..=(table, Uuid::max(), u32::MAX))
+            .flat_map(|(_, report)| report.pages.values().cloned())
             .collect()
     })
 }
