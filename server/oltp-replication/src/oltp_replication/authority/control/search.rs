@@ -264,65 +264,108 @@ pub fn move_ready(assignment: &SearchAssignment, reports: &[SearchReport]) -> bo
     })
 }
 
-/// The reconciler's next command for one table (SearchAssign `StartMove`,
-/// `Publish`), or none: publish a ready move; otherwise give a shard with
-/// fewer than `REPLICAS` a worker of the database it does not have,
-/// preferring another zone; otherwise replace a replica whose worker left.
-pub fn reconcile(
+/// Read the workers needed for placement without loading the whole inventory.
+pub(crate) trait SearchMembership {
+    fn worker_zone(&mut self, worker: Uuid) -> Result<Option<Text<64>>, ProtocolError>;
+    /// Visit workers in inventory order, stopping when the visitor returns true.
+    fn visit_workers(&mut self, visit: impl FnMut(&SearchMember) -> bool) -> Result<(), ProtocolError>;
+}
+
+#[cfg(test)]
+impl SearchMembership for &[SearchMember] {
+    fn worker_zone(&mut self, worker: Uuid) -> Result<Option<Text<64>>, ProtocolError> {
+        Ok(self
+            .iter()
+            .find(|member| member.role == SearchRole::Worker && member.enrollment.worker_id == worker)
+            .map(|member| member.zone.clone()))
+    }
+
+    fn visit_workers(
+        &mut self,
+        mut visit: impl FnMut(&SearchMember) -> bool,
+    ) -> Result<(), ProtocolError> {
+        for member in *self {
+            if member.role == SearchRole::Worker && visit(member) {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The next reconcile command using an in-memory inventory.
+#[cfg(test)]
+fn reconcile(
     assignment: &SearchAssignment,
-    members: &[SearchMember],
+    mut members: &[SearchMember],
     reports: &[SearchReport],
 ) -> Option<SearchCommand> {
+    reconcile_with(assignment, &mut members, reports).unwrap()
+}
+
+/// SearchAssign `StartMove` and `Publish`: publish a ready move or fill a
+/// shard that needs a replica, preferring a worker in another zone.
+pub(crate) fn reconcile_with(
+    assignment: &SearchAssignment,
+    members: &mut impl SearchMembership,
+    reports: &[SearchReport],
+) -> Result<Option<SearchCommand>, ProtocolError> {
     if assignment.next.is_some() {
-        return move_ready(assignment, reports).then_some(SearchCommand::Publish {
+        return Ok(move_ready(assignment, reports).then_some(SearchCommand::Publish {
             table_id: assignment.table_id,
             expected_epoch: assignment.epoch,
-        });
+        }));
     }
-    let workers: Vec<&SearchMember> = members
-        .iter()
-        .filter(|member| member.role == SearchRole::Worker)
-        .collect();
-    let zone = |worker: Uuid| {
-        workers
-            .iter()
-            .find(|member| member.enrollment.worker_id == worker)
-            .map(|member| member.zone.as_str())
+    let Some(epoch) = assignment.epoch.checked_add(1) else {
+        return Ok(None);
     };
-    let epoch = assignment.epoch.checked_add(1)?;
     for (index, shard) in assignment.shards.iter().enumerate() {
-        let serving: Vec<&SearchReplica> =
-            shard.replicas.iter().filter(|replica| replica.draining.is_none()).collect();
-        let gone = serving.iter().find(|replica| zone(replica.worker_id).is_none());
-        if serving.len() >= REPLICAS && gone.is_none() {
+        let mut serving = 0;
+        let mut gone = None;
+        let mut zones = Vec::new();
+        for replica in shard
+            .replicas
+            .iter()
+            .filter(|replica| replica.draining.is_none())
+        {
+            serving += 1;
+            match members.worker_zone(replica.worker_id)? {
+                Some(zone) => zones.push(zone),
+                None => {
+                    gone.get_or_insert(replica.worker_id);
+                }
+            }
+        }
+        if serving >= REPLICAS && gone.is_none() {
             continue;
         }
-        let zones: Vec<&str> = serving.iter().filter_map(|replica| zone(replica.worker_id)).collect();
-        let free = |member: &&&SearchMember| {
-            !shard
-                .replicas
-                .iter()
-                .any(|replica| replica.worker_id == member.enrollment.worker_id)
-        };
-        let pick = workers
-            .iter()
-            .filter(free)
-            .find(|member| !zones.contains(&member.zone.as_str()))
-            .or_else(|| workers.iter().find(free))?;
-        return Some(SearchCommand::BeginMove {
-            table_id: assignment.table_id,
-            expected_epoch: assignment.epoch,
-            mv: SearchMove {
-                shard: u32::try_from(index).ok()?,
-                add: pick.enrollment.worker_id,
-                remove: gone
-                    .filter(|_| serving.len() >= REPLICAS)
-                    .map(|replica| replica.worker_id),
-                epoch,
-            },
-        });
+        let (mut first, mut preferred) = (None, None);
+        members.visit_workers(|member| {
+            let worker = member.enrollment.worker_id;
+            if shard.replicas.iter().any(|replica| replica.worker_id == worker) {
+                return false;
+            }
+            first.get_or_insert(worker);
+            if !zones.contains(&member.zone) {
+                preferred = Some(worker);
+                return true;
+            }
+            false
+        })?;
+        return Ok(preferred.or(first).and_then(|add| {
+            Some(SearchCommand::BeginMove {
+                table_id: assignment.table_id,
+                expected_epoch: assignment.epoch,
+                mv: SearchMove {
+                    shard: u32::try_from(index).ok()?,
+                    add,
+                    remove: gone.filter(|_| serving >= REPLICAS),
+                    epoch,
+                },
+            })
+        }));
     }
-    None
+    Ok(None)
 }
 
 /// Checks a report before it enters leader memory.

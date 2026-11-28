@@ -4,21 +4,22 @@
 use super::*;
 use crate::oltp_replication::{
     authority::control::search::{
-        MAX_MEMBERS_PAGE, SearchRequest, SearchStatus, assignment_key, member_key, range_status,
-        record_report, reconcile, reports,
+        MAX_MEMBERS_PAGE, SearchMembership, SearchRequest, SearchStatus, assignment_key, member_key,
+        range_status, reconcile_with, record_report, reports,
     },
     search_rpc::{
         CallerRole, EmbedModel, RoleCheck, SEARCH_ASSIGNMENT_PREFIX, SEARCH_MEMBER_PREFIX,
         SEARCH_MODEL_PREFIX, SearchAssignment, SearchCommand, SearchMember, SearchRead,
-        SearchReport,
+        SearchReport, SearchRole,
     },
 };
 
 /// Replies of search reads and commands (a members page is at most 32
 /// enrollments, a status at most one entry per range).
 const REPLY_BYTES: usize = 4 << 20;
-/// Models and assignments one read visits.
-const MAX_SCAN: usize = 256;
+/// Bound the serialized assignments decoded together even if one page
+/// contains large routing spans.
+const ASSIGNMENT_PAGE_BYTES: usize = BUDGET.batch_bytes;
 
 impl ControlHandle {
     /// The caller's role from the applied peer directory. A process enrolled
@@ -195,9 +196,9 @@ impl ControlHandle {
             SearchRead::Models => {
                 self.read(|view| {
                     let mut models: Vec<EmbedModel> = Vec::new();
-                    view.scan_page(SEARCH_MODEL_PREFIX, None, MAX_SCAN, |_, bytes| {
+                    scan_search_records(view, SEARCH_MODEL_PREFIX, |bytes| {
                         models.push(machine::decode(bytes)?);
-                        Ok(())
+                        Ok(false)
                     })?;
                     view.encode(&models)
                 })
@@ -223,35 +224,108 @@ impl ControlHandle {
     /// Returns the commands proposed.
     #[doc(hidden)]
     pub async fn search_reconcile_tick(&self) -> Result<usize, ProtocolError> {
-        let term = self.leader_term().await?;
-        let raw = self
-            .read(|view| {
-                let mut assignments: Vec<SearchAssignment> = Vec::new();
-                view.scan_page(SEARCH_ASSIGNMENT_PREFIX, None, MAX_SCAN, |_, bytes| {
-                    assignments.push(machine::decode(bytes)?);
-                    Ok(())
-                })?;
-                let mut members: Vec<SearchMember> = Vec::new();
-                view.scan_page(SEARCH_MEMBER_PREFIX, None, MAX_SCAN, |_, bytes| {
-                    members.push(machine::decode(bytes)?);
-                    Ok(())
-                })?;
-                view.encode(&(assignments, members))
-            })
-            .await?;
-        let (assignments, members): (Vec<SearchAssignment>, Vec<SearchMember>) =
-            machine::decode(raw.as_ref())?;
+        let control = self.identity().group_id;
+        let mut after = None;
         let mut proposed = 0;
-        for assignment in assignments {
-            let reports = reports(self.identity().group_id, term, assignment.table_id)?;
-            let Some(command) = reconcile(&assignment, &members, &reports) else {
-                continue;
+        loop {
+            let term = self.leader_term().await?;
+            let raw = self
+                .machine
+                .store()
+                .read(BUDGET, move |view| {
+                    let mut assignments: Vec<SearchAssignment> = Vec::new();
+                    let mut bytes = 0usize;
+                    let key = after.map(assignment_key);
+                    let progress = view.scan_page_until(
+                        SEARCH_ASSIGNMENT_PREFIX,
+                        key.as_deref(),
+                        MAX_PAGE_ITEMS,
+                        |_, raw| {
+                            assignments.push(machine::decode(raw)?);
+                            bytes = bytes.saturating_add(raw.len());
+                            Ok(bytes >= ASSIGNMENT_PAGE_BYTES)
+                        },
+                    )?;
+                    let cursor = progress
+                        .last_key
+                        .as_ref()
+                        .map(|key| {
+                            Uuid::from_slice(&key.as_slice()[SEARCH_ASSIGNMENT_PREFIX.len()..])
+                                .map_err(|_| stale())
+                        })
+                        .transpose()?;
+                    let mut commands = Vec::new();
+                    for assignment in assignments {
+                        let reports = if assignment.next.is_some() {
+                            reports(control, term, assignment.table_id)?
+                        } else {
+                            Vec::new()
+                        };
+                        if let Some(command) = reconcile_with(&assignment, view, &reports)? {
+                            let operation_id = reconcile_operation(&assignment, &command)?;
+                            commands.push((operation_id, command));
+                        }
+                    }
+                    view.encode(&(cursor, commands))
+                })
+                .await?;
+            let (cursor, commands): (Option<Uuid>, Vec<(Uuid, SearchCommand)>) =
+                machine::decode(raw.as_ref())?;
+            for (operation_id, command) in commands {
+                self.search_command(operation_id, command, None).await?;
+                proposed += 1;
+            }
+            let Some(cursor) = cursor else {
+                return Ok(proposed);
             };
-            let operation_id = reconcile_operation(&assignment, &command)?;
-            self.search_command(operation_id, command, None).await?;
-            proposed += 1;
+            after = Some(cursor);
         }
-        Ok(proposed)
+    }
+}
+
+impl SearchMembership for GroupRead<'_> {
+    fn worker_zone(&mut self, worker: Uuid) -> Result<Option<Text<64>>, ProtocolError> {
+        self.inspect(&member_key(worker), |raw| {
+            let member: Option<SearchMember> = raw.map(machine::decode).transpose()?;
+            Ok(member
+                .filter(|member| member.role == SearchRole::Worker)
+                .map(|member| member.zone))
+        })
+    }
+
+    fn visit_workers(
+        &mut self,
+        mut visit: impl FnMut(&SearchMember) -> bool,
+    ) -> Result<(), ProtocolError> {
+        scan_search_records(self, SEARCH_MEMBER_PREFIX, |raw| {
+            let member: SearchMember = machine::decode(raw)?;
+            Ok(member.role == SearchRole::Worker && visit(&member))
+        })
+    }
+}
+
+/// Scan a prefix in one pinned view, with a cursor for each bounded store page.
+fn scan_search_records(
+    view: &mut GroupRead<'_>,
+    prefix: &[u8],
+    mut visit: impl FnMut(&[u8]) -> Result<bool, ProtocolError>,
+) -> Result<(), ProtocolError> {
+    let mut after = None;
+    loop {
+        let mut stopped = false;
+        let page = view.scan_page_until(
+            prefix,
+            after.as_ref().map(ChargedBytes::as_slice),
+            MAX_PAGE_ITEMS,
+            |_, raw| {
+                stopped = visit(raw)?;
+                Ok(stopped)
+            },
+        )?;
+        if stopped || page.exhausted {
+            return Ok(());
+        }
+        after = page.last_key;
     }
 }
 
