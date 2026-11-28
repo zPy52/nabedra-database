@@ -231,10 +231,33 @@ fn vs14_range_status_counts_a_report_only_for_the_columns_it_names() {
     assert_eq!(status[0].lag_ms, Some(5), "the syncing replica's lag does not count");
 }
 
-/// A late page of a superseded snapshot cannot complete the current snapshot.
-/// A complete snapshot still waits if its thirteenth range is syncing.
+/// Reports are kept per shard, so a worker that moved to another shard at a
+/// newer assignment epoch must not leave its older snapshot counting as
+/// ready in `range_status`. Another worker's snapshot stays.
 #[test]
-fn rvj_a_move_waits_for_every_page_of_the_same_report() {
+fn vs14_a_newer_epoch_retires_the_workers_older_shard_snapshots() {
+    let control = nabedra_rt::ids::uuid_v4();
+    let table = id(1);
+    let old = SearchReport { shard: 1, ..report(10, table, 1, vec![(1, ColumnState::Ready)]) };
+    record_report(control, 1, old).unwrap();
+    let kept = SearchReport { shard: 1, ..report(11, table, 1, vec![(1, ColumnState::Syncing)]) };
+    record_report(control, 1, kept.clone()).unwrap();
+    let mut next = report(10, table, 2, vec![(1, ColumnState::Syncing)]);
+    next.ranges[0].group_id = id(78);
+    record_report(control, 1, next.clone()).unwrap();
+    let held = reports(control, 1, table).unwrap();
+    assert_eq!(held, [next, kept]);
+    assert!(range_status(&held).iter().all(|status| status.ready.is_empty()));
+    let counts = memory(control, 1, |memory| (memory.ranges, memory.worker_ranges.get(&id(10)).copied())).unwrap();
+    assert_eq!(counts, (2, Some(1)), "the retired snapshot's ranges are released");
+}
+
+/// rv-j F4: a move publishes only when every page of one snapshot of the
+/// shard is in (SearchAssign `Report`, `whole`). A late page of a superseded
+/// snapshot cannot complete the current one, and a complete snapshot still
+/// waits while its thirteenth range is syncing.
+#[test]
+fn rvj_a_move_publishes_on_the_first_page_of_a_split_report() {
     let table = id(1);
     let members = [member(10, "a", SearchRole::Worker)];
     let pending = begin_move(None, table, 0, mv(10, None, 1)).unwrap();
