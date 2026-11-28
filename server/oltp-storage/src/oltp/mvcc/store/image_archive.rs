@@ -58,10 +58,24 @@ pub struct ImageRequest {
     /// its restore fences with. The page's columns and the images' vectors
     /// follow them, not the range's current columns, so a column operation
     /// that fences the range after the cut changes nothing in the backup
-    /// (VEC-G10, rv-oltp F1). `None` for a split copy, which a fence cannot
-    /// overtake (both hold the lifecycle guard), and for a plain table.
+    /// (VEC-G10, rv-oltp F1). For a plain Data table at the cut, use
+    /// `plain_search_cut()`. `None` copies the range's current schema for a
+    /// split, whose lifecycle guard prevents a concurrent fence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search: Option<Box<search::SearchSchema>>,
+}
+impl ImageRequest {
+    /// Explicitly plain Catalog image at a backup cut. A fenced Catalog
+    /// search schema always has a nonzero epoch.
+    pub fn plain_search_cut() -> search::SearchSchema {
+        search::SearchSchema {
+            epoch: 0,
+            columns: Vec::new(),
+            high: 0,
+            serving: Vec::new(),
+            text: Vec::new(),
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -228,7 +242,10 @@ impl ParticipantMachine {
                         ));
                     }
                     lineage::validate_read(&config, request.read_ts)?;
-                    let config = match request.search.as_deref() {
+                    let cut_search = request.search.as_deref();
+                    let plain_cut = cut_search == Some(&ImageRequest::plain_search_cut());
+                    let config = match cut_search {
+                        Some(_) if plain_cut => Config { search: None, ..config },
                         Some(cut) => search::at_cut(config, cut)?,
                         None => config,
                     };
@@ -357,6 +374,11 @@ impl ParticipantMachine {
                                 return Err(recovery_unknown());
                             }
                             let value = row::Version::decode(version.value())?;
+                            let value = if plain_cut {
+                                row::Version::plain(value.value)
+                            } else {
+                                value
+                            };
                             let vectors =
                                 row::image_cost(view, logical, &value, records)?
                                     .ok_or_else(row::damaged_value)?;

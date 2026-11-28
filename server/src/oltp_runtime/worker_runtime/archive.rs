@@ -607,13 +607,19 @@ impl WorkerRuntime {
         // Catalog at its cut, which its restore fences with, not the range's
         // current ones (a column operation may fence the range after the cut).
         let search = match (catalog_cut, &scope.group.kind) {
-            (Some(pin), GroupKind::Data { table_id, .. }) => self
-                .native_catalog::<crate::oltp::mvcc::catalog::TableRecord>(
-                    pin,
-                    MvccKey::CatalogTable { table_id: *table_id },
-                )
-                .await?
-                .and_then(|table| table.search.as_ref().map(|search| Box::new(search.schema()))),
+            (Some(pin), GroupKind::Data { table_id, .. }) => {
+                let table = self
+                    .native_catalog::<crate::oltp::mvcc::catalog::TableRecord>(
+                        pin,
+                        MvccKey::CatalogTable { table_id: *table_id },
+                    )
+                    .await?
+                    .ok_or_else(unknown)?;
+                Some(Box::new(table.search.as_ref().map_or_else(
+                    ImageRequest::plain_search_cut,
+                    |search| search.schema(),
+                )))
+            }
             _ => None,
         };
         let mut index = None;
